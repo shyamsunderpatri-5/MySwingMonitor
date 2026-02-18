@@ -4,7 +4,6 @@
 """
 import os
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -55,24 +54,38 @@ except ImportError:
     HAS_GSPREAD = False
     # DO NOT call st.warning() here - set_page_config hasn't been called yet!
 
-# ✅ FIX: Get credentials WITHOUT any st.* calls
+# Get credentials WITHOUT any st.* calls (safe before set_page_config)
+# Priority: Streamlit Secrets → Environment Variable → Error
 credentials = None
-_credential_error = None  # Store error message for later display
+_credential_error = None
 
 try:
-    if 'GCP_SA_KEY' in os.environ:
-        service_account_info = json.loads(os.environ.get('GCP_SA_KEY'))
+    # Step 1: Try Streamlit Secrets (Streamlit Cloud deployment)
+    gcp_key = ""
+    try:
+        gcp_key = st.secrets.get("GCP_SA_KEY", "")
+    except Exception:
+        pass  # st.secrets may not be available in local/test env
+
+    # Step 2: Fall back to OS environment variable (local / GitHub Actions)
+    if not gcp_key:
+        gcp_key = os.environ.get("GCP_SA_KEY", "")
+
+    if gcp_key:
+        service_account_info = json.loads(gcp_key)
         credentials = Credentials.from_service_account_info(
-            service_account_info, 
+            service_account_info,
             scopes=[
                 "https://www.googleapis.com/auth/spreadsheets",
                 "https://www.googleapis.com/auth/drive"
             ]
         )
     else:
-        _credential_error = "GCP_SA_KEY not found in Environment/Secrets"
+        _credential_error = "GCP_SA_KEY not found in Streamlit Secrets or Environment"
+except json.JSONDecodeError:
+    _credential_error = "GCP_SA_KEY is not valid JSON — check the secret value"
 except Exception as e:
-    _credential_error = f"Failed to load credentials: {e}"
+    _credential_error = f"Failed to load GCP credentials: {e}"
 
 # ============================================================================
 # SAFE UTILITY FUNCTIONS
@@ -375,29 +388,31 @@ def get_market_health():
     Returns: dict with status, message, color, action, metrics
     """
     try:
-        # Get NIFTY 50 data
-        nifty = yf.Ticker("^NSEI")
-        nifty_df = nifty.history(period="1mo")
-        
-        if nifty_df.empty:
+        # ── NIFTY 50 via Kite ──────────────────────────────────────────────
+        nifty_df = None
+        if HAS_KITE and kite_session and kite_session.is_connected:
+            nifty_df = kite_session.get_market_index_data("NIFTY 50")
+
+        if nifty_df is None or nifty_df.empty:
             return None
-        
+
         nifty_price = float(nifty_df['Close'].iloc[-1])
-        nifty_prev = float(nifty_df['Close'].iloc[-2]) if len(nifty_df) > 1 else nifty_price
+        nifty_prev  = float(nifty_df['Close'].iloc[-2]) if len(nifty_df) > 1 else nifty_price
         nifty_change = ((nifty_price - nifty_prev) / nifty_prev) * 100
-        
+
         # Calculate NIFTY indicators
         nifty_sma20 = nifty_df['Close'].rolling(20).mean().iloc[-1]
         nifty_sma50 = nifty_df['Close'].rolling(50).mean().iloc[-1] if len(nifty_df) >= 50 else nifty_sma20
-        nifty_rsi = calculate_rsi(nifty_df['Close']).iloc[-1]
-        
+        nifty_rsi   = calculate_rsi(nifty_df['Close']).iloc[-1]
         if pd.isna(nifty_rsi):
             nifty_rsi = 50
-        
-        # Get India VIX (Volatility Index)
-        vix = yf.Ticker("^INDIAVIX")
-        vix_df = vix.history(period="5d")
-        vix_value = float(vix_df['Close'].iloc[-1]) if not vix_df.empty else 15
+
+        # ── India VIX via Kite ─────────────────────────────────────────────
+        vix_value = 15  # safe default
+        if HAS_KITE and kite_session and kite_session.is_connected:
+            vix_df = kite_session.get_market_index_data("INDIA VIX")
+            if vix_df is not None and not vix_df.empty:
+                vix_value = float(vix_df['Close'].iloc[-1])
         
         # Calculate Market Health Score (0-100)
         health_score = 50  # Start neutral
@@ -1162,46 +1177,64 @@ def rate_limited_api_call(ticker, min_interval=0.3):
     st.session_state.api_call_count += 1
     return True
 
-def get_stock_data_safe(ticker, period="6mo"):
-    """Safely fetch stock data with rate limiting"""
-    symbol = ticker if '.NS' in str(ticker) or '.BO' in str(ticker) else f"{ticker}.NS"
+def get_stock_data_safe(ticker, period="6mo", silent=False):
+    """Safely fetch stock data using Kite API with clear error reporting."""
+    # Strip exchange suffix to get clean symbol for Kite
+    symbol = ticker.replace(".NS", "").replace(".BO", "").upper().strip()
+    exchange = "BSE" if ".BO" in str(ticker) else "NSE"
+
+    # ── Guard: Kite must be connected ────────────────────────────────────────
+    if not (HAS_KITE and kite_session and kite_session.is_connected):
+        if not silent:
+            st.warning(
+                f"⚠️ **Kite not connected** — cannot fetch data for `{symbol}`. "
+                f"Please login via the **sidebar → Zerodha Login** section."
+            )
+        return None
+
     max_retries = 3
-    
+
     for attempt in range(max_retries):
         try:
-            rate_limited_api_call(symbol)
-            stock = yf.Ticker(symbol)
-            df = stock.history(period=period)
-            
-            if not df.empty:
+            rate_limited_api_call(ticker)
+            df = kite_session.get_historical_data_by_symbol(
+                symbol, period=period, interval="day", exchange=exchange
+            )
+            if df is not None and not df.empty:
                 df.reset_index(inplace=True)
                 return df
-                
+
+            # Kite returned empty data — token may have expired mid-session
+            if attempt == max_retries - 1:
+                if not silent:
+                    st.error(
+                        f"❌ **No data returned for `{symbol}`**. "
+                        f"Your Kite session may have expired — please re-login via the sidebar."
+                    )
+                logger.warning(f"Kite returned empty data for {symbol} after {max_retries} attempts")
+            else:
+                time.sleep(0.5 * (attempt + 1))
+
         except Exception as e:
             if attempt < max_retries - 1:
-                time.sleep(0.5 * (attempt + 1))  # Reduced backoff
+                time.sleep(0.5 * (attempt + 1))
                 continue
             logger.error(f"API Error for {ticker}: {str(e)}")
             log_email(f"API Error for {ticker}: {str(e)}")
-    
+            if not silent:
+                st.error(f"❌ Failed to fetch `{symbol}`: {e}")
+
     return None
 def get_realtime_price(ticker):
-    """Get real-time price (15-min delayed on free yfinance)"""
-    symbol = ticker if '.NS' in str(ticker) or '.BO' in str(ticker) else f"{ticker}.NS"
+    """Get real-time price via Kite API (true live price when connected)."""
+    symbol   = ticker.replace(".NS", "").replace(".BO", "").upper().strip()
+    exchange = "BSE" if ".BO" in str(ticker) else "NSE"
     try:
-        rate_limited_api_call(symbol)
-        stock = yf.Ticker(symbol)
-        intraday = stock.history(period="1d", interval="5m")
-        
-        if not intraday.empty:
-            return {
-                'price': float(intraday['Close'].iloc[-1]),
-                'high': float(intraday['High'].max()),
-                'low': float(intraday['Low'].min()),
-                'volume': int(intraday['Volume'].sum()),
-                'last_update': str(intraday.index[-1]),
-                'is_realtime': True
-            }
+        rate_limited_api_call(ticker)
+        if HAS_KITE and kite_session and kite_session.is_connected:
+            data = kite_session.get_realtime_price_kite(symbol, exchange)
+            if data:
+                return data
     except Exception as e:
         logger.error(f"Realtime price error for {ticker}: {e}")
     return None
@@ -1209,53 +1242,50 @@ def get_realtime_price(ticker):
 
 def monitor_intraday_sl(ticker, stop_loss, position_type):
     """
-    Check if intraday price has touched/breached SL
+    Check if intraday price has touched/breached SL using Kite API.
     Even if it recovers by EOD, we should know!
     """
-    symbol = ticker if '.NS' in str(ticker) or '.BO' in str(ticker) else f"{ticker}.NS"
+    symbol   = ticker.replace(".NS", "").replace(".BO", "").upper().strip()
+    exchange = "BSE" if ".BO" in str(ticker) else "NSE"
     try:
-        rate_limited_api_call(symbol)
-        stock = yf.Ticker(symbol)
-        intraday = stock.history(period="1d", interval="5m")
-        
-        if intraday.empty:
+        rate_limited_api_call(ticker)
+
+        # ── Live quote gives day OHLC ──────────────────────────────────────
+        if HAS_KITE and kite_session and kite_session.is_connected:
+            instrument_key = f"{exchange}:{symbol}"
+            quote = kite_session.get_quote([instrument_key])
+            data  = quote.get(instrument_key)
+            if data:
+                ohlc    = data.get("ohlc", {})
+                day_low  = float(ohlc.get("low",  0))
+                day_high = float(ohlc.get("high", 0))
+                current  = float(data.get("last_price", 0))
+            else:
+                return None
+        else:
             return None
-        
-        day_low = float(intraday['Low'].min())
-        day_high = float(intraday['High'].max())
-        current = float(intraday['Close'].iloc[-1])
-        
+
         result = {
-            'current': current,
-            'day_low': day_low,
-            'day_high': day_high,
-            'sl_touched': False,
-            'sl_breached': False,
-            'worst_breach': 0,
-            'recovered': False,
-            'close_below_sl': False  # ✅ For swing trading
+            'current': current, 'day_low': day_low, 'day_high': day_high,
+            'sl_touched': False, 'sl_breached': False,
+            'worst_breach': 0, 'recovered': False, 'close_below_sl': False
         }
-        
+
         if position_type == 'LONG':
             if day_low <= stop_loss:
-                result['sl_touched'] = True
-                result['sl_breached'] = current < stop_loss
-                result['worst_breach'] = (
-                    (stop_loss - day_low) / stop_loss
-                ) * 100
-                result['recovered'] = current > stop_loss
-                # ✅ Swing trading: Only true breach if CLOSING below SL
+                result['sl_touched']    = True
+                result['sl_breached']   = current < stop_loss
+                result['worst_breach']  = ((stop_loss - day_low) / stop_loss) * 100
+                result['recovered']     = current > stop_loss
                 result['close_below_sl'] = current < stop_loss
         else:  # SHORT
             if day_high >= stop_loss:
-                result['sl_touched'] = True
-                result['sl_breached'] = current > stop_loss
-                result['worst_breach'] = (
-                    (day_high - stop_loss) / stop_loss
-                ) * 100
-                result['recovered'] = current < stop_loss
+                result['sl_touched']    = True
+                result['sl_breached']   = current > stop_loss
+                result['worst_breach']  = ((day_high - stop_loss) / stop_loss) * 100
+                result['recovered']     = current < stop_loss
                 result['close_below_sl'] = current > stop_loss
-        
+
         return result
     except Exception as e:
         logger.error(f"Intraday SL monitor error for {ticker}: {e}")
@@ -1920,43 +1950,50 @@ def calculate_momentum_score(df):
 # ============================================================================
 
 def multi_timeframe_analysis(ticker, position_type):
-    """Analyze multiple timeframes with rate limiting."""
-    symbol = ticker if '.NS' in str(ticker) else f"{ticker}.NS"
-    
+    """Analyze multiple timeframes using Kite API."""
+    symbol   = ticker.replace(".NS", "").replace(".BO", "").upper().strip()
+    exchange = "BSE" if ".BO" in str(ticker) else "NSE"
+
     try:
-        rate_limited_api_call(symbol)
-        stock = yf.Ticker(symbol)
-        
+        rate_limited_api_call(ticker)
+
         timeframes = {}
-        
-        # Daily
-        try:
-            daily_df = stock.history(period="3mo", interval="1d")
-            if len(daily_df) >= 20:
-                timeframes['Daily'] = daily_df
-        except:
-            pass
-        
-        time.sleep(0.3)
-        
-        # Weekly
-        try:
-            weekly_df = stock.history(period="1y", interval="1wk")
-            if len(weekly_df) >= 10:
-                timeframes['Weekly'] = weekly_df
-        except:
-            pass
-        
-        # Hourly (only during market hours)
-        is_open, _, _, _ = is_market_hours()
-        if is_open:
-            time.sleep(0.3)
+
+        if HAS_KITE and kite_session and kite_session.is_connected:
+            # Daily
             try:
-                hourly_df = stock.history(period="5d", interval="1h")
-                if len(hourly_df) >= 10:
-                    timeframes['Hourly'] = hourly_df
-            except:
+                daily_df = kite_session.get_historical_data_by_symbol(
+                    symbol, period="3mo", interval="day", exchange=exchange
+                )
+                if daily_df is not None and len(daily_df) >= 20:
+                    timeframes['Daily'] = daily_df
+            except Exception:
                 pass
+
+            time.sleep(0.2)
+
+            # Weekly
+            try:
+                weekly_df = kite_session.get_historical_data_by_symbol(
+                    symbol, period="1y", interval="week", exchange=exchange
+                )
+                if weekly_df is not None and len(weekly_df) >= 10:
+                    timeframes['Weekly'] = weekly_df
+            except Exception:
+                pass
+
+            # Hourly (only during market hours)
+            is_open, _, _, _ = is_market_hours()
+            if is_open:
+                time.sleep(0.2)
+                try:
+                    hourly_df = kite_session.get_historical_data_by_symbol(
+                        symbol, period="5d", interval="60minute", exchange=exchange
+                    )
+                    if hourly_df is not None and len(hourly_df) >= 10:
+                        timeframes['Hourly'] = hourly_df
+                except Exception:
+                    pass
         
         if not timeframes:
             return {
@@ -2084,7 +2121,7 @@ def calculate_correlation_matrix(tickers, period="3mo"):
     price_data = {}
     
     for ticker in tickers:
-        df = get_stock_data_safe(ticker, period=period)
+        df = get_stock_data_safe(ticker, period=period, silent=True)
         if df is not None and len(df) > 20:
             price_data[ticker] = df['Close'].pct_change().dropna()
         time.sleep(0.2)
@@ -3407,7 +3444,7 @@ def get_15min_confirmation(ticker, side, daily_entry_price):
                 
                 # Get 15-min data via Kite quote (simplified approach)
                 # Full historical requires instrument tokens
-                quote = kite_session.kite.quote(f"NSE:{ticker_clean}")
+                quote = kite_session.get_quote([f"NSE:{ticker_clean}"])
                 ohlc = quote.get(f"NSE:{ticker_clean}", {}).get("ohlc", {})
                 
                 if ohlc:
@@ -3429,16 +3466,17 @@ def get_15min_confirmation(ticker, side, daily_entry_price):
             except Exception as e:
                 logger.warning(f"Kite 15min failed for {ticker}: {e}")
         
-        # Method 2: Fallback to yfinance
+        # Method 2: Fallback — use Kite intraday 15-min candles
         if df_15 is None:
             try:
-                rate_limited_api_call(symbol, min_interval=0.5)
-                stock = yf.Ticker(symbol)
-                df_15 = stock.history(period="2d", interval="15m")
+                if HAS_KITE and kite_session and kite_session.is_connected:
+                    ticker_clean_kite = ticker.replace(".NS", "").replace(".BO", "").upper().strip()
+                    rate_limited_api_call(ticker, min_interval=0.5)
+                    df_15 = kite_session.get_intraday_data(ticker_clean_kite, interval="15minute")
             except Exception as e:
-                logger.error(f"yfinance 15min failed for {ticker}: {e}")
+                logger.error(f"Kite 15min fallback failed for {ticker}: {e}")
         
-        # If we got yfinance data, extract what we need
+        # If we got Kite intraday data, extract what we need
         if df_15 is not None and len(df_15) >= 5:
             # Get today's candles
             if hasattr(df_15.index, 'date'):
@@ -4693,7 +4731,20 @@ def get_google_sheet_connection():
         if credentials is None:
             return None, "Google credentials not configured"
         gc = gspread.authorize(credentials)
-        sh = gc.open("my_portfolio")
+
+        # Read Sheet ID from Streamlit Secrets first, then env var
+        sheet_id = ""
+        try:
+            sheet_id = st.secrets.get("GOOGLE_SHEET_ID", "")
+        except Exception:
+            pass
+        if not sheet_id:
+            sheet_id = os.environ.get("GOOGLE_SHEET_ID", "")
+
+        if sheet_id:
+            sh = gc.open_by_key(sheet_id)   # ← preferred: open by ID
+        else:
+            sh = gc.open("my_portfolio")    # ← fallback: open by name
         return sh.sheet1, "success"
     except Exception as e:
         return None, str(e)
@@ -5896,19 +5947,20 @@ def render_sidebar():
         # =====================================================================
         st.markdown("### 📧 Email Alerts")
         
-        # ╔═══════════════════════════════════════════════════════════════╗
-        # ║  CREDENTIALS: Read from environment variables (SECURE)       ║
-        # ║  Set these in your terminal or Streamlit secrets:            ║
-        # ║    export SMTP_EMAIL="your-email@gmail.com"                  ║
-        # ║    export SMTP_APP_PASSWORD="xxxx xxxx xxxx xxxx"            ║
-        # ║    export SMTP_RECIPIENT="recipient@gmail.com"               ║
-        # ╚═══════════════════════════════════════════════════════════════╝
-        YOUR_EMAIL = os.environ.get("SMTP_EMAIL", "")
-        YOUR_APP_PASSWORD = os.environ.get("SMTP_APP_PASSWORD", "")
-        YOUR_RECIPIENT = os.environ.get(
-            "SMTP_RECIPIENT",
-            os.environ.get("SMTP_EMAIL", "")
-        )
+        # Reads Streamlit Secrets first (cloud), then env vars (local)
+        # Streamlit Secrets keys: EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECIPIENT
+        def _get_secret(key, default=""):
+            try:
+                val = st.secrets.get(key, "")
+                if val:
+                    return val
+            except Exception:
+                pass
+            return os.environ.get(key, default)
+
+        YOUR_EMAIL        = _get_secret("EMAIL_SENDER")
+        YOUR_APP_PASSWORD = _get_secret("EMAIL_PASSWORD")
+        YOUR_RECIPIENT    = _get_secret("EMAIL_RECIPIENT") or YOUR_EMAIL
         
         # Check if credentials are configured
         credentials_configured = bool(
@@ -7018,10 +7070,6 @@ def main():
             'Status': ['ACTIVE', 'ACTIVE', 'ACTIVE']
         })
         st.dataframe(sample_df, use_container_width=True)
-    if warnings:
-        with st.expander("⚠️ Validation Warnings", expanded=False):
-            for warning in warnings:
-                st.warning(warning)
     
     # =========================================================================
     # ANALYZE ALL POSITIONS
