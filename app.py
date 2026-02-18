@@ -309,6 +309,35 @@ def init_session_state():
             st.session_state[key] = default_value
 
 init_session_state()
+def handle_kite_cloud_login():
+    """
+    Auto-detects Zerodha redirect token from URL on Streamlit Cloud.
+    Zerodha redirects back to your app like:
+    https://yourapp.streamlit.app/?request_token=AbCd1234&status=success
+    """
+    query_params = st.query_params
+
+    if "request_token" in query_params and "status" in query_params:
+        if query_params["status"] == "success":
+            request_token = query_params["request_token"]
+            st.sidebar.success("🔑 Request token detected!")
+
+            if not st.session_state.get('kite_connected'):
+                with st.sidebar:
+                    with st.spinner("Connecting to Zerodha..."):
+                        success, msg = kite_session.login_with_request_token(
+                            request_token
+                        )
+                        if success:
+                            st.session_state['kite_connected'] = True
+                            st.session_state['kite_mode'] = 'LIVE'
+                            st.success(f"✅ {msg}")
+                            st.query_params.clear()
+                            st.rerun()
+                        else:
+                            st.error(f"❌ Login failed: {msg}")
+
+
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -5858,7 +5887,7 @@ def render_sidebar():
     Render the sidebar with all settings and calculators
     Returns: dictionary with all settings
     """
-    
+    handle_kite_cloud_login()
     with st.sidebar:
         st.markdown("## ⚙️ Settings")
         
