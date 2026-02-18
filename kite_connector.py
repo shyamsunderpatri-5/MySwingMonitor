@@ -18,6 +18,7 @@ import logging
 import time
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, Dict, Any
+from zoneinfo import ZoneInfo
 
 
 logger = logging.getLogger(__name__)
@@ -705,6 +706,207 @@ class KiteSession:
         """Reset daily order counter (call at start of each day)"""
         self.daily_order_count = 0
         self.order_log = []
+
+    # ========================================================================
+    # MARKET DATA - HISTORICAL & LIVE (replaces yfinance)
+    # ========================================================================
+
+    # ── Well-known NSE instrument tokens ─────────────────────────────────────
+    KNOWN_TOKENS = {
+        "NIFTY 50":  256265,   # ^NSEI equivalent
+        "INDIA VIX": 264969,   # ^INDIAVIX equivalent
+    }
+
+    # ── Interval mapping: yfinance-style → Kite interval string ──────────────
+    _KITE_INTERVAL = {
+        "1m": "minute",  "5m":  "5minute",  "15m": "15minute",
+        "30m": "30minute", "60m": "60minute", "1h":  "60minute",
+        "1d": "day",     "1wk": "week",      "1mo": "month",
+    }
+
+    def _period_to_dates(self, period: str):
+        """Convert a yfinance-style period string to (from_date, to_date) in IST."""
+        _MAP = {
+            "1d": 1,  "2d": 2,  "5d": 5,
+            "1mo": 30, "3mo": 90, "6mo": 180,
+            "1y": 365, "2y": 730,
+        }
+        days = _MAP.get(period, 90)
+        # Use IST so date boundaries align with NSE trading calendar
+        to_dt   = datetime.now(ZoneInfo("Asia/Kolkata"))
+        from_dt = to_dt - timedelta(days=days)
+        return from_dt, to_dt
+
+    def get_instrument_token(self, symbol: str, exchange: str = "NSE") -> Optional[int]:
+        """
+        Resolve a trading symbol to its Kite instrument token.
+        Token results are cached per symbol; full instrument lists are cached per
+        exchange so the heavy download (thousands of rows) happens only once per
+        session, not once per stock.
+        """
+        if not hasattr(self, "_token_cache"):
+            self._token_cache: Dict[str, int] = {}
+        # Cache the full instruments list per exchange to avoid repeated downloads
+        if not hasattr(self, "_instruments_cache"):
+            self._instruments_cache: Dict[str, list] = {}
+
+        cache_key = f"{exchange}:{symbol}"
+        if cache_key in self._token_cache:
+            return self._token_cache[cache_key]
+
+        # Return hard-coded tokens for indices immediately
+        if symbol in self.KNOWN_TOKENS:
+            self._token_cache[cache_key] = self.KNOWN_TOKENS[symbol]
+            return self.KNOWN_TOKENS[symbol]
+
+        if not self.is_connected or not self.kite:
+            logger.warning("get_instrument_token: Not connected")
+            return None
+
+        try:
+            # Download full instruments list once per exchange, then reuse
+            if exchange not in self._instruments_cache:
+                logger.info(f"Downloading instruments list for {exchange} (one-time)...")
+                self._instruments_cache[exchange] = self.kite.instruments(exchange)
+
+            for inst in self._instruments_cache[exchange]:
+                if inst["tradingsymbol"] == symbol.upper():
+                    token = inst["instrument_token"]
+                    self._token_cache[cache_key] = token
+                    return token
+            logger.warning(f"Token not found for {exchange}:{symbol}")
+            return None
+        except Exception as e:
+            logger.error(f"get_instrument_token error for {symbol}: {e}")
+            return None
+
+    def get_historical_data(
+        self,
+        instrument_token: int,
+        from_date,
+        to_date,
+        interval: str = "day",
+        continuous: bool = False,
+    ) -> Optional[Any]:
+        """
+        Fetch OHLCV history from Kite and return as a pandas DataFrame
+        with columns: Date, Open, High, Low, Close, Volume
+        (compatible with the yfinance-style DataFrames used in the app).
+        """
+        try:
+            import pandas as pd
+            records = self.kite.historical_data(
+                instrument_token,
+                from_date=from_date,
+                to_date=to_date,
+                interval=interval,
+                continuous=continuous,
+            )
+            if not records:
+                return None
+            df = pd.DataFrame(records)
+            # Kite returns: date, open, high, low, close, volume [, oi]
+            df.rename(columns={
+                "date": "Date", "open": "Open", "high": "High",
+                "low": "Low", "close": "Close", "volume": "Volume",
+            }, inplace=True)
+            df["Date"] = pd.to_datetime(df["Date"])
+            df.set_index("Date", inplace=True)
+            return df
+        except Exception as e:
+            logger.error(f"get_historical_data error (token={instrument_token}): {e}")
+            return None
+
+    def get_historical_data_by_symbol(
+        self,
+        symbol: str,
+        period: str = "6mo",
+        interval: str = "day",
+        exchange: str = "NSE",
+    ) -> Optional[Any]:
+        """
+        Convenience wrapper: fetch OHLCV by symbol + period string.
+        Returns a DataFrame or None on failure.
+        """
+        token = self.get_instrument_token(symbol, exchange)
+        if token is None:
+            return None
+        from_dt, to_dt = self._period_to_dates(period)
+        kite_interval = self._KITE_INTERVAL.get(interval, interval)
+        return self.get_historical_data(token, from_dt, to_dt, kite_interval)
+
+    def get_quote(self, instruments: list) -> Dict:
+        """
+        Fetch full quote for a list of instruments, e.g. ["NSE:RELIANCE", "NSE:TCS"].
+        Returns the raw Kite quote dict.
+        """
+        if not self.is_connected or not self.kite:
+            return {}
+        try:
+            return self.kite.quote(instruments)
+        except Exception as e:
+            logger.error(f"get_quote error: {e}")
+            return {}
+
+    def get_ltp(self, instruments: list) -> Dict:
+        """
+        Fetch last traded price for a list of instruments.
+        Returns {instrument_key: {"instrument_token": .., "last_price": ..}}
+        """
+        if not self.is_connected or not self.kite:
+            return {}
+        try:
+            return self.kite.ltp(instruments)
+        except Exception as e:
+            logger.error(f"get_ltp error: {e}")
+            return {}
+
+    def get_intraday_data(
+        self, symbol: str, interval: str = "5minute", exchange: str = "NSE"
+    ) -> Optional[Any]:
+        """
+        Fetch today's intraday candles for *symbol* at *interval*.
+        Returns a DataFrame (same schema as get_historical_data) or None.
+        """
+        token = self.get_instrument_token(symbol, exchange)
+        if token is None:
+            return None
+        today = datetime.now()
+        from_dt = today.replace(hour=9, minute=0, second=0, microsecond=0)
+        return self.get_historical_data(token, from_dt, today, interval)
+
+    def get_realtime_price_kite(self, symbol: str, exchange: str = "NSE") -> Optional[Dict]:
+        """
+        Return real-time price snapshot for *symbol*.
+        Returns: {price, high, low, volume, last_update, is_realtime} or None.
+        """
+        instrument_key = f"{exchange}:{symbol}"
+        quote = self.get_quote([instrument_key])
+        data = quote.get(instrument_key)
+        if not data:
+            return None
+        ohlc = data.get("ohlc", {})
+        return {
+            "price": float(data.get("last_price", 0)),
+            "high":  float(ohlc.get("high", 0)),
+            "low":   float(ohlc.get("low", 0)),
+            "volume": int(data.get("volume", 0)),
+            "last_update": str(data.get("timestamp", datetime.now())),
+            "is_realtime": True,
+        }
+
+    def get_market_index_data(self, index: str = "NIFTY 50") -> Optional[Any]:
+        """
+        Fetch 3-month daily history for a market index (NIFTY 50 or INDIA VIX).
+        3 months (~65 trading days) ensures SMA50 calculations are valid.
+        Returns a DataFrame or None.
+        """
+        token = self.KNOWN_TOKENS.get(index)
+        if token is None:
+            logger.warning(f"Unknown index: {index}")
+            return None
+        from_dt, to_dt = self._period_to_dates("3mo")   # 3mo → ~65 trading days ≥ 50
+        return self.get_historical_data(token, from_dt, to_dt, "day")
 
 
 # ============================================================================
