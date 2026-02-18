@@ -19,26 +19,17 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 def _load_credentials():
-    """
-    Load API credentials safely from Streamlit secrets or env vars.
-    Never hardcode keys here.
-    """
     api_key = ""
     api_secret = ""
-
-    # Try Streamlit Secrets first (Streamlit Cloud)
     try:
         api_key = st.secrets.get("KITE_API_KEY", "")
         api_secret = st.secrets.get("KITE_API_SECRET", "")
     except Exception:
         pass
-
-    # Fallback to environment variables (local terminal / GitHub Actions)
     if not api_key:
         api_key = os.environ.get("KITE_API_KEY", "")
     if not api_secret:
         api_secret = os.environ.get("KITE_API_SECRET", "")
-
     return api_key, api_secret
 
 
@@ -73,16 +64,12 @@ def load_token():
     try:
         if not Path(TOKEN_FILE).exists():
             return None, False, "No token file found. Please login."
-
         with open(TOKEN_FILE, "r") as f:
             token_data = json.load(f)
-
         access_token = token_data.get("access_token", "")
         expires_at_str = token_data.get("expires_at", "")
-
         if not access_token:
             return None, False, "Token file is empty. Please login."
-
         try:
             expires_at = datetime.fromisoformat(expires_at_str)
             if datetime.now() >= expires_at:
@@ -92,7 +79,6 @@ def load_token():
             return access_token, True, f"Token valid. Expires in {hours_left:.1f} hours."
         except (ValueError, TypeError):
             return access_token, False, "Cannot verify expiry."
-
     except json.JSONDecodeError:
         return None, False, "Token file corrupted. Please login again."
     except Exception as e:
