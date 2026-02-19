@@ -90,7 +90,40 @@ except Exception as e:
 # ============================================================================
 # SAFE UTILITY FUNCTIONS
 # ============================================================================
+def update_token_in_sheet(access_token):
+    """Auto-update KiteConfig sheet with new access token after login"""
+    try:
+        if not credentials:
+            logger.warning("No Google credentials - cannot update KiteConfig sheet")
+            return False
 
+        client = gspread.authorize(credentials)
+        sheet = client.open_by_key("155htPsyom2e-dR5BZJx_cFzGxjQQjePJt3H2sRLSr6w")
+
+        # Get KiteConfig tab, create if missing
+        try:
+            config_sheet = sheet.worksheet("KiteConfig")
+        except:
+            config_sheet = sheet.add_worksheet("KiteConfig", rows=10, cols=2)
+            config_sheet.update("A1:B3", [
+                ["Setting", "Value"],
+                ["API_KEY", ""],
+                ["ACCESS_TOKEN", ""]
+            ])
+
+        # Find ACCESS_TOKEN row and update value
+        cell = config_sheet.find("ACCESS_TOKEN")
+        if cell:
+            config_sheet.update_cell(cell.row, 2, access_token)
+            logger.info("✅ KiteConfig sheet updated with new token automatically")
+            return True
+
+        return False
+
+    except Exception as e:
+        logger.error(f"Failed to update KiteConfig sheet: {e}")
+        return False
+    
 def safe_divide(numerator, denominator, default=0.0):
     """Safe division that handles zero and NaN"""
     try:
@@ -344,6 +377,7 @@ def handle_kite_cloud_login():
                         if success:
                             st.session_state['kite_connected'] = True
                             st.session_state['kite_mode'] = 'LIVE'
+                            update_token_in_sheet(kite_session.kite.access_token)
                             st.success(f"✅ {msg}")
                             st.query_params.clear()
                             st.rerun()
@@ -381,8 +415,8 @@ def is_market_hours():
 # GAP 1: MARKET HEALTH CHECK (NIFTY + VIX)
 # ============================================================================
 
-@st.cache_data(ttl=300)  # Cache for 5 minutes
-def get_market_health():
+@st.cache_data(ttl=300, show_spinner=False)
+def get_market_health(_kite_connected: bool = False):
     """
     Analyze NIFTY 50 and India VIX to determine overall market health
     Returns: dict with status, message, color, action, metrics
@@ -710,48 +744,89 @@ def detect_chart_patterns(df, current_price):
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # PATTERN 1: DOUBLE TOP (Bearish)
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    last_30 = df.tail(30)
+    last_30 = df.tail(30).reset_index(drop=True)
     highs_30 = last_30['High']
-    
-    # Find two highest peaks
-    sorted_highs = highs_30.nlargest(5)
-    if len(sorted_highs) >= 2:
-        peak1 = sorted_highs.iloc[0]
-        peak2 = sorted_highs.iloc[1]
-        
-        # Check if peaks are similar (within 2%)
-        if abs(peak1 - peak2) / peak1 < 0.02:
-            # Check if current price is below peaks
-            if current_price < peak1 * 0.98:
-                patterns.append({
-                    'name': 'DOUBLE TOP',
-                    'signal': 'BEARISH',
-                    'strength': 'HIGH',
-                    'icon': '📉',
-                    'description': f'Resistance at ₹{peak1:.2f} tested twice',
-                    'action': 'Watch for breakdown - potential reversal'
-                })
-    
+    lows_30  = last_30['Low']
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # PATTERN 1: DOUBLE TOP (Bearish)
+    # Requires: two similar peaks SEPARATED by 5+ candles with a valley between
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    peak1_pos = int(highs_30.idxmax())
+    peak1_val = float(highs_30.iloc[peak1_pos])
+
+    # Find second peak — must be at least 5 candles away from peak1
+    peak2_pos, peak2_val = None, 0.0
+    for i, val in highs_30.items():
+        if abs(int(i) - peak1_pos) >= 5:
+            if val > peak2_val:
+                peak2_val = float(val)
+                peak2_pos = int(i)
+
+    if peak2_pos is not None:
+        left  = min(peak1_pos, peak2_pos)
+        right = max(peak1_pos, peak2_pos)
+
+        # Valley between the two peaks (must dip at least 3% below peaks)
+        valley = float(last_30['Low'].iloc[left:right + 1].min())
+        peaks_avg = (peak1_val + peak2_val) / 2
+
+        peaks_similar = abs(peak1_val - peak2_val) / peak1_val < 0.02
+        valley_deep   = valley < peaks_avg * 0.97
+        price_below   = current_price < peaks_avg * 0.98
+
+        if peaks_similar and valley_deep and price_below:
+            patterns.append({
+                'name': 'DOUBLE TOP',
+                'signal': 'BEARISH',
+                'strength': 'HIGH',
+                'icon': '📉',
+                'description': (
+                    f'Resistance at ₹{peaks_avg:.2f} tested twice '
+                    f'({abs(right - left)} candles apart)'
+                ),
+                'action': 'Watch for breakdown - potential reversal'
+            })
+
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # PATTERN 2: DOUBLE BOTTOM (Bullish)
+    # Requires: two similar lows SEPARATED by 5+ candles with a peak between
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    lows_30 = last_30['Low']
-    sorted_lows = lows_30.nsmallest(5)
-    
-    if len(sorted_lows) >= 2:
-        bottom1 = sorted_lows.iloc[0]
-        bottom2 = sorted_lows.iloc[1]
-        
-        if abs(bottom1 - bottom2) / bottom1 < 0.02:
-            if current_price > bottom1 * 1.02:
-                patterns.append({
-                    'name': 'DOUBLE BOTTOM',
-                    'signal': 'BULLISH',
-                    'strength': 'HIGH',
-                    'icon': '📈',
-                    'description': f'Support at ₹{bottom1:.2f} held twice',
-                    'action': 'Watch for breakout - potential reversal'
-                })
+    bot1_pos = int(lows_30.idxmin())
+    bot1_val = float(lows_30.iloc[bot1_pos])
+
+    # Find second bottom — must be at least 5 candles away from bot1
+    bot2_pos, bot2_val = None, float('inf')
+    for i, val in lows_30.items():
+        if abs(int(i) - bot1_pos) >= 5:
+            if val < bot2_val:
+                bot2_val = float(val)
+                bot2_pos = int(i)
+
+    if bot2_pos is not None:
+        left  = min(bot1_pos, bot2_pos)
+        right = max(bot1_pos, bot2_pos)
+
+        # Peak between the two bottoms (must rise at least 3% above bottoms)
+        mid_peak   = float(last_30['High'].iloc[left:right + 1].max())
+        bots_avg   = (bot1_val + bot2_val) / 2
+
+        bots_similar = abs(bot1_val - bot2_val) / bot1_val < 0.02
+        peak_high    = mid_peak > bots_avg * 1.03
+        price_above  = current_price > bots_avg * 1.02
+
+        if bots_similar and peak_high and price_above:
+            patterns.append({
+                'name': 'DOUBLE BOTTOM',
+                'signal': 'BULLISH',
+                'strength': 'HIGH',
+                'icon': '📈',
+                'description': (
+                    f'Support at ₹{bots_avg:.2f} held twice '
+                    f'({abs(right - left)} candles apart)'
+                ),
+                'action': 'Watch for breakout - potential reversal'
+            })
     
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # PATTERN 3: BULLISH ENGULFING (Bullish)
@@ -4011,7 +4086,7 @@ def smart_analyze_position(ticker, position_type, entry_price, quantity, stop_lo
     Complete smart analysis with all features
     Accepts sidebar parameters for dynamic thresholds
     """
-    df = get_stock_data_safe(ticker, period="6mo")
+    df = get_stock_data_safe(ticker, period="6mo", silent=True)
     if df is None or df.empty:
         return None
     
@@ -6945,7 +7020,8 @@ def main():
     # =========================================================================
     st.divider()
     
-    market_health = get_market_health()
+    market_health = get_market_health(
+    _kite_connected=kite_session.is_connected if kite_session else False)
     
     if market_health:
         st.markdown(f"""
