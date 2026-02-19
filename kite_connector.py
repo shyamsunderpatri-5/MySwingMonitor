@@ -871,7 +871,8 @@ class KiteSession:
         token = self.get_instrument_token(symbol, exchange)
         if token is None:
             return None
-        today = datetime.now()
+        # CORRECT — always 9:00 AM IST regardless of server timezone
+        today = datetime.now(ZoneInfo("Asia/Kolkata"))
         from_dt = today.replace(hour=9, minute=0, second=0, microsecond=0)
         return self.get_historical_data(token, from_dt, today, interval)
 
@@ -908,7 +909,135 @@ class KiteSession:
         from_dt, to_dt = self._period_to_dates("3mo")   # 3mo → ~65 trading days ≥ 50
         return self.get_historical_data(token, from_dt, to_dt, "day")
 
+# ========================================================================
+    # MARKET DATA - HISTORICAL & LIVE (replaces yfinance)
+    # ========================================================================
 
+    KNOWN_TOKENS = {
+        "NIFTY 50":  256265,
+        "INDIA VIX": 264969,
+    }
+
+    _KITE_INTERVAL = {
+        "1m": "minute",  "5m":  "5minute",  "15m": "15minute",
+        "30m": "30minute", "60m": "60minute", "1h":  "60minute",
+        "1d": "day",     "1wk": "week",      "1mo": "month",
+    }
+
+    def _period_to_dates(self, period: str):
+        from zoneinfo import ZoneInfo
+        _MAP = {
+            "1d": 1,  "2d": 2,  "5d": 5,
+            "1mo": 30, "3mo": 90, "6mo": 180,
+            "1y": 365, "2y": 730,
+        }
+        days = _MAP.get(period, 90)
+        to_dt   = datetime.now(ZoneInfo("Asia/Kolkata"))
+        from_dt = to_dt - timedelta(days=days)
+        return from_dt, to_dt
+
+    def get_instrument_token(self, symbol: str, exchange: str = "NSE"):
+        if not hasattr(self, "_token_cache"):
+            self._token_cache = {}
+        if not hasattr(self, "_instruments_cache"):
+            self._instruments_cache = {}
+        cache_key = f"{exchange}:{symbol}"
+        if cache_key in self._token_cache:
+            return self._token_cache[cache_key]
+        if symbol in self.KNOWN_TOKENS:
+            self._token_cache[cache_key] = self.KNOWN_TOKENS[symbol]
+            return self.KNOWN_TOKENS[symbol]
+        if not self.is_connected or not self.kite:
+            return None
+        try:
+            if exchange not in self._instruments_cache:
+                self._instruments_cache[exchange] = self.kite.instruments(exchange)
+            for inst in self._instruments_cache[exchange]:
+                if inst["tradingsymbol"] == symbol.upper():
+                    token = inst["instrument_token"]
+                    self._token_cache[cache_key] = token
+                    return token
+            return None
+        except Exception as e:
+            logger.error(f"get_instrument_token error for {symbol}: {e}")
+            return None
+
+    def get_historical_data(self, instrument_token, from_date, to_date, interval="day", continuous=False):
+        try:
+            import pandas as pd
+            records = self.kite.historical_data(
+                instrument_token, from_date=from_date, to_date=to_date,
+                interval=interval, continuous=continuous,
+            )
+            if not records:
+                return None
+            df = pd.DataFrame(records)
+            df.rename(columns={"date": "Date", "open": "Open", "high": "High",
+                                "low": "Low", "close": "Close", "volume": "Volume"}, inplace=True)
+            df["Date"] = pd.to_datetime(df["Date"])
+            df.set_index("Date", inplace=True)
+            return df
+        except Exception as e:
+            logger.error(f"get_historical_data error (token={instrument_token}): {e}")
+            return None
+
+    def get_historical_data_by_symbol(self, symbol: str, period: str = "6mo",
+                                       interval: str = "day", exchange: str = "NSE"):
+        token = self.get_instrument_token(symbol, exchange)
+        if token is None:
+            return None
+        from_dt, to_dt = self._period_to_dates(period)
+        kite_interval = self._KITE_INTERVAL.get(interval, interval)
+        return self.get_historical_data(token, from_dt, to_dt, kite_interval)
+
+    def get_quote(self, instruments: list):
+        if not self.is_connected or not self.kite:
+            return {}
+        try:
+            return self.kite.quote(instruments)
+        except Exception as e:
+            logger.error(f"get_quote error: {e}")
+            return {}
+
+    def get_ltp(self, instruments: list):
+        if not self.is_connected or not self.kite:
+            return {}
+        try:
+            return self.kite.ltp(instruments)
+        except Exception as e:
+            logger.error(f"get_ltp error: {e}")
+            return {}
+
+    def get_intraday_data(self, symbol: str, interval: str = "5minute", exchange: str = "NSE"):
+        token = self.get_instrument_token(symbol, exchange)
+        if token is None:
+            return None
+        today = datetime.now()
+        from_dt = today.replace(hour=9, minute=0, second=0, microsecond=0)
+        return self.get_historical_data(token, from_dt, today, interval)
+
+    def get_realtime_price_kite(self, symbol: str, exchange: str = "NSE"):
+        instrument_key = f"{exchange}:{symbol}"
+        quote = self.get_quote([instrument_key])
+        data = quote.get(instrument_key)
+        if not data:
+            return None
+        ohlc = data.get("ohlc", {})
+        return {
+            "price": float(data.get("last_price", 0)),
+            "high":  float(ohlc.get("high", 0)),
+            "low":   float(ohlc.get("low", 0)),
+            "volume": int(data.get("volume", 0)),
+            "last_update": str(data.get("timestamp", datetime.now())),
+            "is_realtime": True,
+        }
+
+    def get_market_index_data(self, index: str = "NIFTY 50"):
+        token = self.KNOWN_TOKENS.get(index)
+        if token is None:
+            return None
+        from_dt, to_dt = self._period_to_dates("3mo")
+        return self.get_historical_data(token, from_dt, to_dt, "day")
 # ============================================================================
 # SINGLETON INSTANCE (Use this in your main app)
 # ============================================================================
