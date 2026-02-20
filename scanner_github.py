@@ -6629,7 +6629,26 @@ def github_actions_main():
     
     try:
         logger.info("🚀 Starting stock scan...")
-        
+
+        # ── Initialize Kite session so scanner uses Kite data (not Yahoo) ──
+        try:
+            from auto_token_refresh import refresh_token_auto
+            from kite_connector import kite_session
+            from config_kite import token_needs_refresh
+
+            if token_needs_refresh():
+                logger.info("🔄 Token expired — refreshing before scan...")
+                ok, msg = refresh_token_auto()
+                logger.info(f"Token refresh: {msg}")
+
+            ok, msg = kite_session.initialize()
+            if ok:
+                logger.info(f"✅ Kite connected — will use Kite historical data")
+            else:
+                logger.warning(f"⚠️ Kite init failed ({msg}) — fallback to Yahoo Finance")
+        except Exception as e:
+            logger.warning(f"⚠️ Kite setup error: {e} — fallback to Yahoo Finance")
+
         # ✅ Run the main scanner
         results = main()
         
