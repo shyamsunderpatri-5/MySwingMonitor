@@ -1,0 +1,43 @@
+name: Kite Token Auto Refresh
+
+on:
+  schedule:
+    # Runs at 3:15 AM UTC = 8:45 AM IST, every weekday (Mon-Fri)
+    - cron: '15 3 * * 1-5'
+
+  # Allow manual trigger from GitHub Actions tab anytime
+  workflow_dispatch:
+
+jobs:
+  refresh-token:
+    runs-on: ubuntu-latest
+
+    env:
+      KITE_API_KEY:     ${{ secrets.KITE_API_KEY }}
+      KITE_API_SECRET:  ${{ secrets.KITE_API_SECRET }}
+      KITE_USER_ID:     ${{ secrets.KITE_USER_ID }}
+      KITE_PASSWORD:    ${{ secrets.KITE_PASSWORD }}
+      KITE_TOTP_SECRET: ${{ secrets.KITE_TOTP_SECRET }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install kiteconnect pyotp requests streamlit
+
+      - name: Run token refresh
+        run: python auto_token_refresh.py
+
+      - name: Commit updated token file
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add kite_token.json
+          git diff --cached --quiet || git commit -m "chore: auto refresh kite token [skip ci]"
+          git push
