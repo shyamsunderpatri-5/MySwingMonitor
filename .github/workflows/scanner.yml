@@ -35,7 +35,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          run: pip install -r requirements.txt
+          pip install -r requirements.txt
+          pip install ta scipy
                
       - name: Refresh Kite Token (before scan)
         run: python auto_token_refresh.py
