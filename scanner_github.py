@@ -364,7 +364,7 @@ def update_google_sheet(signals_data):
         # ════════════════════════════════════════════════════════════════════
 
         logger.info("✅ Backtest check delegated to final_trade_gate() - already validated")
-        logger.info(f"   Min Standards: WR ≥ {MIN_BACKTEST_WR}%, PF ≥ {MIN_BACKTEST_PF}x")
+        
         
         # ════════════════════════════════════════════════════════════════════
         # ENSURE HEADERS EXIST
