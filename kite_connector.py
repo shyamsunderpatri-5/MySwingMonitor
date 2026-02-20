@@ -1038,6 +1038,100 @@ class KiteSession:
             return None
         from_dt, to_dt = self._period_to_dates("3mo")
         return self.get_historical_data(token, from_dt, to_dt, "day")
+
+    # ========================================================================
+    # FIX 2: SHORT_ALERT ORDER GUARD
+    # Any signal with side == "SHORT_ALERT" must never reach Zerodha as a
+    # live CNC order (NSE equity shorts are not supported for delivery).
+    # ========================================================================
+
+    @staticmethod
+    def _is_short_alert(side: str) -> bool:
+        """Return True if this is an alert-only short (not executable via CNC)."""
+        return "SHORT_ALERT" in str(side).upper()
+
+    def safe_place_order(
+        self,
+        ticker: str,
+        quantity: int,
+        side: str,
+        order_type: str = "MARKET",
+        price: float = 0,
+        product: str = "CNC",
+        tag: str = "SmartMonitor",
+    ) -> Tuple[bool, str, Optional[str]]:
+        """
+        FIX 2: Central order placement that blocks SHORT_ALERT signals.
+        Use this instead of calling place_exit_order() directly.
+        """
+        if self._is_short_alert(side):
+            msg = (
+                f"ORDER BLOCKED — {ticker} is a SHORT_ALERT (CNC equity shorts "
+                "not supported on NSE).  Use futures/options to take short exposure."
+            )
+            logger.warning(msg)
+            return False, msg, None
+
+        # Determine transaction type from side
+        if "SELL" in side.upper() or side.upper() in ("SHORT", "EXIT_LONG"):
+            transaction_type = "SELL"
+        else:
+            transaction_type = "BUY"
+
+        return self.place_exit_order(
+            ticker=ticker,
+            quantity=quantity,
+            transaction_type=transaction_type,
+            order_type=order_type,
+            price=price,
+            product=product,
+            tag=tag,
+        )
+
+    # ========================================================================
+    # FIX 6: AUTO TOKEN REFRESH INTEGRATION
+    # ========================================================================
+
+    def ensure_valid_token(self, auto_refresh: bool = True) -> Tuple[bool, str]:
+        """
+        Check token validity and auto-refresh if needed.
+        Call this at the start of each session / GitHub Actions run.
+
+        Args:
+            auto_refresh: If True (default), attempt auto-refresh when token
+                          is expired.  Requires KITE_TOTP_SECRET env var.
+
+        Returns: (is_ready, message)
+        """
+        # Try initialising with saved token first
+        success, msg = self.initialize()
+        if success:
+            return True, msg
+
+        if not auto_refresh:
+            return False, f"Token invalid and auto-refresh disabled: {msg}"
+
+        logger.info("Token invalid — attempting auto-refresh...")
+        try:
+            from auto_token_refresh import refresh_token_auto
+            refreshed, refresh_msg = refresh_token_auto()
+            if not refreshed:
+                return False, f"Auto-refresh failed: {refresh_msg}"
+
+            # Re-initialise with the new token
+            success, msg = self.initialize()
+            if success:
+                return True, f"Auto-refreshed and connected: {msg}"
+            return False, f"Refreshed but init failed: {msg}"
+
+        except ImportError:
+            return False, (
+                "auto_token_refresh.py not found.  "
+                "Place it next to kite_connector.py and install: "
+                "pip install pyotp requests"
+            )
+        except Exception as e:
+            return False, f"Auto-refresh error: {e}"
 # ============================================================================
 # SINGLETON INSTANCE (Use this in your main app)
 # ============================================================================
