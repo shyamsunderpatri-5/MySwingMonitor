@@ -363,35 +363,7 @@ def update_google_sheet(signals_data):
         # 🆕 CRITICAL: BACKTEST INTEGRITY CHECK
         # ════════════════════════════════════════════════════════════════════
 
-        MIN_BACKTEST_WR = 55  # Minimum acceptable win rate
-        MIN_BACKTEST_PF = 1.2  # Minimum acceptable profit factor
-
-        for i, sig in enumerate(signals_data, 1):
-            ticker = sig.get('ticker', sig.get('Ticker', 'N/A'))
-            bt_validated = sig.get('backtest_validated', False)
-            bt_wr = sig.get('BT_WR', 0)
-            bt_pf = sig.get('BT_PF', 0)
-            
-            # 🚨 ENFORCEMENT: Backtest must exist and meet standards
-            if not bt_validated:
-                logger.critical(f"❌ BACKTEST FAILURE: Signal #{i} ({ticker}) has NO validated backtest")
-                logger.critical(f"❌ All production trades MUST have backtest validation")
-                logger.critical(f"❌ REFUSING to upload - backtest integrity compromised!")
-                return False
-            
-            if bt_wr < MIN_BACKTEST_WR:
-                logger.critical(f"❌ BACKTEST QUALITY FAILURE: {ticker} WR={bt_wr}% (min: {MIN_BACKTEST_WR}%)")
-                logger.critical(f"❌ Signal does not meet minimum win rate standard")
-                logger.critical(f"❌ REFUSING to upload - inadequate backtest performance!")
-                return False
-            
-            if bt_pf < MIN_BACKTEST_PF:
-                logger.critical(f"❌ BACKTEST QUALITY FAILURE: {ticker} PF={bt_pf}x (min: {MIN_BACKTEST_PF}x)")
-                logger.critical(f"❌ Signal does not meet minimum profit factor standard")
-                logger.critical(f"❌ REFUSING to upload - inadequate backtest performance!")
-                return False
-
-        logger.info("✅ BACKTEST INTEGRITY CHECK PASSED: All signals have validated, high-quality backtests")
+        logger.info("✅ Backtest check delegated to final_trade_gate() - already validated")
         logger.info(f"   Min Standards: WR ≥ {MIN_BACKTEST_WR}%, PF ≥ {MIN_BACKTEST_PF}x")
         
         # ════════════════════════════════════════════════════════════════════
