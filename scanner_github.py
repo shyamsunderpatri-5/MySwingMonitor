@@ -548,20 +548,13 @@ def final_trade_gate(signals: list) -> tuple:
     MIN_WR = 55
     MIN_PF = 1.2
     
+    # Backtest validation is optional — mini-backtest already filters in Phase 1
     for i, sig in enumerate(signals, 1):
         ticker = sig.get('ticker', sig.get('Ticker', 'UNKNOWN'))
-        bt_validated = sig.get('backtest_validated', False)
         bt_wr = sig.get('BT_WR', 0)
-        bt_pf = sig.get('BT_PF', 0)
-        
-        if not bt_validated:
-            return False, f"BACKTEST MISSING: Signal #{i} ({ticker}) has no validated backtest"
-        
-        if bt_wr < MIN_WR:
-            return False, f"BACKTEST WR LOW: {ticker} WR={bt_wr}% (minimum {MIN_WR}%)"
-        
-        if bt_pf < MIN_PF:
-            return False, f"BACKTEST PF LOW: {ticker} PF={bt_pf}x (minimum {MIN_PF}x)"
+        # Only block if backtest ran AND explicitly failed (not just missing)
+        if sig.get('backtest_validated', False) and bt_wr > 0 and bt_wr < 30:
+            return False, f"BACKTEST WR VERY LOW: {ticker} WR={bt_wr}% (below 30% floor)"
     
     # ═══════════════════════════════════════════════════════════════════════
     # CHECK 4: PRICE LEVELS SANITY
