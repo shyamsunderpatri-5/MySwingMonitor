@@ -4256,7 +4256,7 @@ def build_cache(tickers: List[str]) -> Optional[pd.DataFrame]:
                 'ticker': test_ticker  # Store the actual ticker that worked
             })
             
-            clean_df['Date'] = pd.to_datetime(clean_df['Date'])
+            clean_df['Date'] = pd.to_datetime(clean_df['Date']).dt.tz_localize(None)
             
             # Final validation
             if clean_df['Close'].nunique() < 10:
@@ -6353,8 +6353,14 @@ def main():
     df_all = build_cache(tickers)
     
     if df_all is None or df_all.empty:
-        print("❌ Failed to build price cache")
-        return
+            print("❌ Failed to build price cache")
+            return
+
+        # Fix tz-naive vs tz-aware mixed timestamps (Kite=aware, yfinance=naive)
+    df_all['Date'] = pd.to_datetime(df_all['Date']).dt.tz_localize(None)
+
+    # ========================================================================
+    # FIX 3: CACHE VALIDATION
     
     # ========================================================================
     # FIX 3: CACHE VALIDATION
