@@ -35,10 +35,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install kiteconnect pyotp requests streamlit
-          pip install yfinance pandas numpy
-          pip install google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client
-
+          run: pip install -r requirements.txt
+               
       - name: Refresh Kite Token (before scan)
         run: python auto_token_refresh.py
 
