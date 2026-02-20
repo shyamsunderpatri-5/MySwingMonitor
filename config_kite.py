@@ -35,6 +35,23 @@ def _load_credentials():
 
 KITE_API_KEY, KITE_API_SECRET = _load_credentials()
 
+# ── FIX 6: Additional credentials needed for auto token refresh ──────────────
+# These are NEVER logged. Store only in GitHub Secrets / Streamlit Secrets.
+def _get_secret(name: str) -> str:
+    """Read from Streamlit Secrets first, then environment variable."""
+    try:
+        val = st.secrets.get(name, "")
+        if val:
+            return val
+    except Exception:
+        pass
+    return os.environ.get(name, "")
+
+KITE_USER_ID    = _get_secret("KITE_USER_ID")    # Zerodha login ID
+KITE_PASSWORD   = _get_secret("KITE_PASSWORD")    # Zerodha password
+KITE_TOTP_SECRET = _get_secret("KITE_TOTP_SECRET") # Base32 TOTP secret
+# ─────────────────────────────────────────────────────────────────────────────
+
 # ============================================================================
 # TOKEN STORAGE
 # ============================================================================
@@ -97,6 +114,23 @@ def clear_token():
 
 def is_configured():
     return bool(KITE_API_KEY and KITE_API_SECRET)
+
+
+def can_auto_refresh():
+    """FIX 6: True when all credentials for auto-refresh are available."""
+    return bool(
+        KITE_API_KEY and KITE_API_SECRET
+        and KITE_USER_ID and KITE_PASSWORD and KITE_TOTP_SECRET
+    )
+
+
+def token_needs_refresh() -> bool:
+    """
+    FIX 6: Quick check — return True if token is absent/expired so the caller
+    knows to trigger auto_token_refresh.refresh_token_auto() before trading.
+    """
+    _, is_valid, _ = load_token()
+    return not is_valid
 
 
 def get_login_url():
