@@ -808,6 +808,23 @@ SECTOR_KEYWORDS = {
 }
 
 
+
+import pandas as pd
+import numpy as np
+import requests
+from io import StringIO
+
+# Technical Analysis
+from ta.momentum import RSIIndicator, ROCIndicator
+from ta.trend import MACD, EMAIndicator, ADXIndicator
+from ta.volatility import AverageTrueRange, BollingerBands
+from ta.volume import OnBalanceVolumeIndicator
+from scipy import stats
+from scipy.signal import argrelextrema
+
+warnings.filterwarnings('ignore')
+
+
 # ============================================================================
 # KITE DATA PROVIDER — main class
 # ============================================================================
@@ -1518,20 +1535,7 @@ class KiteDataProvider:
 
 kite_provider = KiteDataProvider()
 
-import pandas as pd
-import numpy as np
-import requests
-from io import StringIO
 
-# Technical Analysis
-from ta.momentum import RSIIndicator, ROCIndicator
-from ta.trend import MACD, EMAIndicator, ADXIndicator
-from ta.volatility import AverageTrueRange, BollingerBands
-from ta.volume import OnBalanceVolumeIndicator
-from scipy import stats
-from scipy.signal import argrelextrema
-
-warnings.filterwarnings('ignore')
 
 # ============================================================================
 # CONFIGURATION - CHANGE THESE SETTINGS
