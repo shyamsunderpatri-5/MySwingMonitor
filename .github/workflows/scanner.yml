@@ -1,0 +1,55 @@
+name: NSE Scanner Daily Run
+
+on:
+  schedule:
+    # Runs at 10:30 AM UTC = 4:00 PM IST, every weekday (Mon-Fri)
+    - cron: '30 10 * * 1-5'
+
+  # Allow manual trigger from GitHub Actions tab anytime
+  workflow_dispatch:
+
+jobs:
+  run-scanner:
+    runs-on: ubuntu-latest
+
+    env:
+      KITE_API_KEY:           ${{ secrets.KITE_API_KEY }}
+      KITE_API_SECRET:        ${{ secrets.KITE_API_SECRET }}
+      KITE_USER_ID:           ${{ secrets.KITE_USER_ID }}
+      KITE_PASSWORD:          ${{ secrets.KITE_PASSWORD }}
+      KITE_TOTP_SECRET:       ${{ secrets.KITE_TOTP_SECRET }}
+      EMAIL_SENDER:           ${{ secrets.EMAIL_SENDER }}
+      EMAIL_PASSWORD:         ${{ secrets.EMAIL_PASSWORD }}
+      EMAIL_RECIPIENT:        ${{ secrets.EMAIL_RECIPIENT }}
+      GOOGLE_SHEET_ID:        ${{ secrets.GOOGLE_SHEET_ID }}
+      GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install kiteconnect pyotp requests streamlit
+          pip install yfinance pandas numpy
+          pip install google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client
+
+      - name: Refresh Kite Token (before scan)
+        run: python auto_token_refresh.py
+
+      - name: Run NSE Scanner
+        run: python scanner_github.py
+
+      - name: Upload signal files as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: scanner-signals-${{ github.run_number }}
+          path: |
+            signals*/
+            logs/
+          retention-days: 7
