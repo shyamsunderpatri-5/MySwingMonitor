@@ -751,7 +751,773 @@ if sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
-import yfinance as yf
+# ============================================================================
+# KITE DATA PROVIDER (inlined — replaces all yfinance calls)
+# ============================================================================
+
+INDEX_TOKENS = {
+    "NIFTY 50":         256265,
+    "NIFTY BANK":       260105,
+    "INDIA VIX":        264969,
+    "NIFTY IT":         259849,
+    "NIFTY AUTO":       258801,
+    "NIFTY PHARMA":     261889,
+    "NIFTY FMCG":       257801,
+    "NIFTY METAL":      258121,
+    "NIFTY REALTY":     260361,
+    "NIFTY ENERGY":     265,
+    "NIFTY INFRA":      258537,
+    "NIFTY PSU BANK":   261641,
+    "NIFTY FIN SERVICE":257537,
+    "NIFTY MEDIA":      258633,
+    "NIFTY MIDCAP 100": 262153,
+    "NIFTY SMALLCAP 100": 261145,
+}
+
+# Sector name → Kite index name mapping  (matches SectorRotationAnalyzer keys)
+SECTOR_TO_INDEX = {
+    "BANKING":          "NIFTY BANK",
+    "IT":               "NIFTY IT",
+    "PHARMA":           "NIFTY PHARMA",
+    "AUTO":             "NIFTY AUTO",
+    "FMCG":             "NIFTY FMCG",
+    "METAL":            "NIFTY METAL",
+    "REALTY":           "NIFTY REALTY",
+    "ENERGY":           "NIFTY ENERGY",
+    "INFRA":            "NIFTY INFRA",
+    "PSU_BANK":         "NIFTY PSU BANK",
+    "FINANCIALS":       "NIFTY FIN SERVICE",
+    "MEDIA":            "NIFTY MEDIA",
+}
+
+# ============================================================================
+# NSE SECTOR → human sector label (used in get_fundamentals fallback)
+# ============================================================================
+SECTOR_KEYWORDS = {
+    "Financial Services": "FINANCIALS",
+    "Banks":              "BANKING",
+    "Information Technology": "IT",
+    "Healthcare":         "PHARMA",
+    "Automobile":         "AUTO",
+    "Consumer Goods":     "FMCG",
+    "Metals":             "METAL",
+    "Real Estate":        "REALTY",
+    "Energy":             "ENERGY",
+    "Infrastructure":     "INFRA",
+    "Media":              "MEDIA",
+}
+
+
+# ============================================================================
+# KITE DATA PROVIDER — main class
+# ============================================================================
+
+class KiteDataProvider:
+    """
+    Drop-in replacement for all yfinance usage.
+    Uses Kite Connect (via kite_session from kite_connector).
+
+    Singleton usage:
+        df = kite_provider.get_historical_df("RELIANCE", days=800)
+    """
+
+    def __init__(self):
+        self._kite = None                      # raw kiteconnect.KiteConnect object
+        self._kite_session = None             # kite_connector wrapper
+        self._instrument_cache: Dict[str, int] = {}   # symbol → token
+        self._instruments_loaded = False
+        self._fundamentals_cache: Dict[str, Tuple] = {}
+
+        # Historical data cache (in-memory for current run)
+        self._hist_cache: Dict[str, pd.DataFrame] = {}
+
+        self._connect()
+
+    # ------------------------------------------------------------------ #
+    # INITIALISATION                                                       #
+    # ------------------------------------------------------------------ #
+
+    def _connect(self):
+        """Connect to Kite via existing kite_connector."""
+        try:
+            from kite_connector import kite_session as _ks
+            self._kite_session = _ks
+
+            if not _ks.is_connected:
+                ok, msg = _ks.initialize()
+                if not ok:
+                    logger.warning(f"Kite session init failed: {msg}")
+                    return
+
+            # Grab the raw KiteConnect object if exposed
+            if hasattr(_ks, 'kite'):
+                self._kite = _ks.kite
+            elif hasattr(_ks, '_kite'):
+                self._kite = _ks._kite
+
+            logger.info(f"✅ KiteDataProvider connected: {_ks.is_connected}")
+
+        except ImportError:
+            logger.error("kite_connector not found — cannot use Kite API")
+        except Exception as e:
+            logger.error(f"Kite connect error: {e}")
+
+    @property
+    def is_connected(self) -> bool:
+        return (self._kite_session is not None and
+                getattr(self._kite_session, 'is_connected', False))
+
+    # ------------------------------------------------------------------ #
+    # INSTRUMENT TOKEN CACHE                                               #
+    # ------------------------------------------------------------------ #
+
+    def _load_instruments(self):
+        """Load & cache NSE instrument tokens once per run."""
+        if self._instruments_loaded:
+            return
+
+        try:
+            if self._kite:
+                raw = self._kite.instruments("NSE")
+            elif self._kite_session and hasattr(self._kite_session, 'get_instruments'):
+                raw = self._kite_session.get_instruments("NSE")
+            else:
+                logger.warning("No method to load instruments — tokens unavailable")
+                return
+
+            for inst in raw:
+                sym = inst.get('tradingsymbol', '')
+                token = inst.get('instrument_token')
+                if sym and token:
+                    self._instrument_cache[sym] = token
+
+            self._instruments_loaded = True
+            logger.info(f"✅ Loaded {len(self._instrument_cache)} NSE instrument tokens")
+
+        except Exception as e:
+            logger.error(f"Instrument load failed: {e}")
+
+    def get_token(self, symbol: str) -> Optional[int]:
+        """Get Kite instrument token for a stock symbol (no .NS suffix)."""
+        # Check session wrapper first (it may have its own cache)
+        if self._kite_session and hasattr(self._kite_session, 'get_instrument_token'):
+            try:
+                token = self._kite_session.get_instrument_token(symbol, exchange="NSE")
+                if token:
+                    return token
+            except Exception:
+                pass
+
+        # Fall back to our own cache
+        if not self._instruments_loaded:
+            self._load_instruments()
+
+        return self._instrument_cache.get(symbol)
+
+    def get_index_token(self, index_name: str) -> Optional[int]:
+        """Return hardcoded token for NSE indices."""
+        return INDEX_TOKENS.get(index_name)
+
+    # ------------------------------------------------------------------ #
+    # HISTORICAL DATA — STOCKS                                             #
+    # ------------------------------------------------------------------ #
+
+    def get_historical_df(
+        self,
+        symbol: str,
+        days: int = 800,
+        interval: str = "day",
+        end_date: Optional[datetime] = None,
+    ) -> Optional[pd.DataFrame]:
+        """
+        Fetch OHLCV DataFrame for a stock via Kite historical API.
+        Returns DataFrame with columns: Open, High, Low, Close, Volume
+        Index: DatetimeIndex (tz-naive)
+        """
+        cache_key = f"{symbol}_{days}_{interval}"
+        if cache_key in self._hist_cache:
+            return self._hist_cache[cache_key]
+
+        token = self.get_token(symbol)
+        if not token:
+            logger.debug(f"No token for {symbol}")
+            return None
+
+        end = end_date or datetime.now()
+        start = end - timedelta(days=days)
+
+        df = self._fetch_historical(token, start, end, interval)
+        if df is not None:
+            self._hist_cache[cache_key] = df
+
+        return df
+
+    def _fetch_historical(
+        self,
+        token: int,
+        from_date: datetime,
+        to_date: datetime,
+        interval: str = "day",
+        retries: int = 3,
+    ) -> Optional[pd.DataFrame]:
+        """
+        Core Kite historical_data call with chunking and retry.
+        Kite limits: max 2000 candles for day, max 60 days for minute.
+        We chunk into 400-day windows to be safe.
+        """
+        all_chunks = []
+        chunk_days = 400 if interval == "day" else 60
+
+        chunk_start = from_date
+        while chunk_start < to_date:
+            chunk_end = min(chunk_start + timedelta(days=chunk_days), to_date)
+
+            for attempt in range(retries):
+                try:
+                    if self._kite:
+                        raw = self._kite.historical_data(
+                            token,
+                            chunk_start.strftime("%Y-%m-%d"),
+                            chunk_end.strftime("%Y-%m-%d"),
+                            interval,
+                        )
+                    elif self._kite_session and hasattr(self._kite_session, 'get_historical_data'):
+                        raw = self._kite_session.get_historical_data(
+                            instrument_token=token,
+                            from_date=chunk_start,
+                            to_date=chunk_end,
+                            interval=interval,
+                        )
+                    else:
+                        return None
+
+                    if raw:
+                        all_chunks.extend(raw)
+                    break
+
+                except Exception as e:
+                    if attempt < retries - 1:
+                        time.sleep(1.5 * (attempt + 1))
+                    else:
+                        logger.debug(f"Historical fetch failed token={token}: {e}")
+
+            chunk_start = chunk_end + timedelta(days=1)
+
+        if not all_chunks:
+            return None
+
+        return self._raw_to_df(all_chunks)
+
+    @staticmethod
+    def _raw_to_df(raw: list) -> pd.DataFrame:
+        """Convert Kite raw list-of-dicts to a clean OHLCV DataFrame."""
+        df = pd.DataFrame(raw)
+
+        # Normalise column names (Kite returns lowercase)
+        col_map = {
+            'date':   'Date',
+            'open':   'Open',
+            'high':   'High',
+            'low':    'Low',
+            'close':  'Close',
+            'volume': 'Volume',
+        }
+        df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+
+        if 'Date' not in df.columns:
+            return None
+
+        df['Date'] = pd.to_datetime(df['Date']).dt.tz_localize(None)
+        df = df.set_index('Date').sort_index()
+
+        # Keep only OHLCV
+        keep = [c for c in ['Open', 'High', 'Low', 'Close', 'Volume'] if c in df.columns]
+        df = df[keep].dropna(subset=['Close'])
+
+        for col in keep:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        return df if len(df) >= 10 else None
+
+    # ------------------------------------------------------------------ #
+    # HISTORICAL DATA — INDICES                                            #
+    # ------------------------------------------------------------------ #
+
+    def get_index_df(
+        self,
+        index_name: str,
+        days: int = 90,
+        interval: str = "day",
+    ) -> Optional[pd.DataFrame]:
+        """
+        Fetch OHLCV DataFrame for an NSE index (NIFTY 50, INDIA VIX, etc.)
+        """
+        cache_key = f"IDX_{index_name}_{days}"
+        if cache_key in self._hist_cache:
+            return self._hist_cache[cache_key]
+
+        token = self.get_index_token(index_name)
+        if not token:
+            logger.debug(f"No token for index: {index_name}")
+            return None
+
+        end = datetime.now()
+        start = end - timedelta(days=days)
+
+        df = self._fetch_historical(token, start, end, interval)
+        if df is not None:
+            self._hist_cache[cache_key] = df
+
+        return df
+
+    # ------------------------------------------------------------------ #
+    # NIFTY 50 HELPERS                                                     #
+    # ------------------------------------------------------------------ #
+
+    def get_nifty50_df(self, days: int = 90) -> Optional[pd.DataFrame]:
+        return self.get_index_df("NIFTY 50", days=days)
+
+    def get_nifty50_returns(self, lookback: int = 20) -> Optional[pd.Series]:
+        df = self.get_nifty50_df(days=lookback + 10)
+        if df is None:
+            return None
+        return df['Close'].pct_change().dropna().tail(lookback)
+
+    # ------------------------------------------------------------------ #
+    # INDIA VIX                                                            #
+    # ------------------------------------------------------------------ #
+
+    def get_vix_data(self, days: int = 30) -> Optional[pd.DataFrame]:
+        return self.get_index_df("INDIA VIX", days=days)
+
+    # ------------------------------------------------------------------ #
+    # SECTOR INDICES                                                        #
+    # ------------------------------------------------------------------ #
+
+    def get_sector_df(self, sector_key: str, days: int = 30) -> Optional[pd.DataFrame]:
+        """
+        sector_key: one of SECTOR_TO_INDEX keys
+                    e.g. 'BANKING', 'IT', 'PHARMA' …
+        """
+        index_name = SECTOR_TO_INDEX.get(sector_key.upper())
+        if not index_name:
+            return None
+        return self.get_index_df(index_name, days=days)
+
+    def get_sector_return_pct(self, sector_key: str, lookback_days: int = 10) -> Optional[float]:
+        """10-day return % for a sector index."""
+        df = self.get_sector_df(sector_key, days=lookback_days + 5)
+        if df is None or len(df) < 2:
+            return None
+        close = df['Close'].dropna()
+        if len(close) < 2:
+            return None
+        return (float(close.iloc[-1]) / float(close.iloc[-min(lookback_days, len(close) - 1)]) - 1) * 100
+
+    # ------------------------------------------------------------------ #
+    # FUNDAMENTALS (sector, PE)                                            #
+    # ------------------------------------------------------------------ #
+
+    def get_fundamentals(self, symbol: str) -> Tuple[Optional[str], Optional[float]]:
+        """
+        Returns (sector, pe_ratio).
+        Uses Kite instruments for sector, falls back to NSE stock name matching.
+        PE is not available from Kite — we skip it (return None).
+        """
+        if symbol in self._fundamentals_cache:
+            return self._fundamentals_cache[symbol]
+
+        sector = None
+        pe = None
+
+        try:
+            if not self._instruments_loaded:
+                self._load_instruments()
+
+            # Try to get instrument info from instruments list
+            if self._kite:
+                instruments = self._kite.instruments("NSE")
+                for inst in instruments:
+                    if inst.get('tradingsymbol') == symbol:
+                        name = inst.get('name', '').upper()
+                        # Rough sector inference from company name keywords
+                        sector = self._infer_sector_from_name(name, symbol)
+                        break
+
+        except Exception as e:
+            logger.debug(f"Fundamentals lookup failed for {symbol}: {e}")
+
+        result = (sector, pe)
+        self._fundamentals_cache[symbol] = result
+        return result
+
+    @staticmethod
+    def _infer_sector_from_name(name: str, symbol: str) -> Optional[str]:
+        """Rough sector inference from company name / symbol."""
+        n = name.upper()
+        s = symbol.upper()
+
+        # Banking
+        if any(k in n for k in ['BANK', 'BANKING', 'NBF', 'NBFC']):
+            return 'Financial Services'
+        # IT
+        if any(k in n for k in ['TECH', 'INFOSY', 'WIPRO', 'INFRA', 'SOFTWARE', 'DIGIT', 'IT LTD', 'SYSTEMS']):
+            return 'Information Technology'
+        # Pharma
+        if any(k in n for k in ['PHARMA', 'DRUG', 'MEDICINE', 'HEALTH', 'BIOCON', 'CIPLA', 'LUPIN']):
+            return 'Healthcare'
+        # Auto
+        if any(k in n for k in ['AUTO', 'MOTOR', 'AUTOMOBILE', 'TRACTOR', 'VEHICLES', 'BAJAJ']):
+            return 'Automobile'
+        # FMCG
+        if any(k in n for k in ['FOODS', 'BEVERAGES', 'CONSUMER', 'HINDUSTAN UNILEVER', 'ITC', 'MARICO', 'BRITANNIA']):
+            return 'Consumer Goods'
+        # Metal
+        if any(k in n for k in ['STEEL', 'METAL', 'ALUMIN', 'COPPER', 'ZINC', 'IRON']):
+            return 'Metals'
+        # Energy
+        if any(k in n for k in ['OIL', 'GAS', 'PETRO', 'POWER', 'ENERGY', 'COAL']):
+            return 'Energy'
+        # Real Estate
+        if any(k in n for k in ['REALTY', 'REAL ESTATE', 'HOUSING', 'PROPERTY', 'BUILDER', 'DLF']):
+            return 'Real Estate'
+        # Finance (non-banking)
+        if any(k in n for k in ['FINANCE', 'FINANCIAL', 'CAPITAL', 'INVEST', 'AMC', 'INSURANCE']):
+            return 'Financial Services'
+
+        return None
+
+    # ------------------------------------------------------------------ #
+    # BULK CACHE BUILD (replaces build_cache in scanner)                  #
+    # ------------------------------------------------------------------ #
+
+    def build_bulk_cache(
+        self,
+        symbols: List[str],
+        days: int = 800,
+        max_workers: int = 8,
+    ) -> Optional[pd.DataFrame]:
+        """
+        Download historical data for all symbols using Kite.
+        Returns a combined DataFrame with a 'ticker' column.
+        Mirrors the build_cache() function in scanner_github.py.
+        """
+        all_data = []
+        failed = []
+        successful = 0
+
+        def download_one(symbol: str):
+            clean_sym = symbol.replace('.NS', '').replace('.BO', '')
+            df = self.get_historical_df(clean_sym, days=days)
+            if df is not None and len(df) >= 60:
+                df = df.copy().reset_index()
+                df['ticker'] = clean_sym
+                return df
+            return None
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(download_one, s): s for s in symbols}
+            i = 0
+            for future in as_completed(futures):
+                symbol = futures[future]
+                i += 1
+                try:
+                    result = future.result(timeout=30)
+                    if result is not None:
+                        all_data.append(result)
+                        successful += 1
+                    else:
+                        failed.append(symbol)
+                except Exception:
+                    failed.append(symbol)
+
+                if i % 25 == 0 or i == len(symbols):
+                    print(
+                        f"  Progress: {i}/{len(symbols)} | "
+                        f"Success: {successful} | Failed: {len(failed)}",
+                        end="\r",
+                        flush=True,
+                    )
+
+        print()
+
+        if not all_data:
+            logger.error("No data downloaded from Kite!")
+            return None
+
+        df_all = pd.concat(all_data, axis=0, ignore_index=True)
+        logger.info(f"✅ Kite cache: {df_all['ticker'].nunique()} stocks, "
+                    f"{len(df_all):,} bars")
+        return df_all
+
+    # ------------------------------------------------------------------ #
+    # MARKET REGIME (replaces MarketRegimeFilter.get_market_regime)       #
+    # ------------------------------------------------------------------ #
+
+    def get_market_regime(self) -> Dict:
+        """
+        Compute Nifty 50 regime using Kite data.
+        Mirrors MarketRegimeFilter.get_market_regime().
+        """
+        try:
+            df = self.get_nifty50_df(days=90)
+            if df is None or len(df) < 50:
+                return {"regime": "UNKNOWN", "score": 0, "bias": "NEUTRAL"}
+
+            close = df['Close']
+            ema20 = close.ewm(span=20, adjust=False).mean()
+            ema50 = close.ewm(span=50, adjust=False).mean()
+            ema200 = close.ewm(span=200, adjust=False).mean() if len(close) >= 200 else ema50
+
+            p = float(close.iloc[-1])
+            e20 = float(ema20.iloc[-1])
+            e50 = float(ema50.iloc[-1])
+            e200 = float(ema200.iloc[-1])
+
+            # ADX
+            h, l, c2 = df['High'], df['Low'], close
+            plus_dm = h.diff().clip(lower=0)
+            minus_dm = (-l.diff()).clip(lower=0)
+            tr = pd.concat([h - l, abs(h - c2.shift()), abs(l - c2.shift())], axis=1).max(axis=1)
+            atr14 = tr.rolling(14).mean()
+            plus_di = 100 * (plus_dm.rolling(14).mean() / atr14)
+            minus_di = 100 * (minus_dm.rolling(14).mean() / atr14)
+            dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
+            adx = float(dx.rolling(14).mean().iloc[-1])
+
+            vol = float(close.pct_change().tail(20).std() * np.sqrt(252) * 100)
+
+            if vol > 25:
+                regime, score, bias = "HIGH_VOLATILITY", 0, "CAUTION"
+            elif p > e20 > e50 > e200:
+                regime, score, bias = "STRONG_BULLISH", 10, "LONG"
+            elif p > e20 > e50:
+                regime, score, bias = "BULLISH", 7, "LONG"
+            elif p < e20 < e50 < e200:
+                regime, score, bias = "STRONG_BEARISH", -10, "SHORT"
+            elif p < e20 < e50:
+                regime, score, bias = "BEARISH", -7, "SHORT"
+            elif adx < 20:
+                regime, score, bias = "RANGE_BOUND", 0, "NEUTRAL"
+            else:
+                regime, score, bias = "MIXED", 0, "NEUTRAL"
+
+            return {
+                "regime": regime, "score": score, "bias": bias,
+                "nifty_price": p, "adx": adx, "volatility": vol,
+                "ema20": e20, "ema50": e50, "ema200": e200,
+            }
+
+        except Exception as e:
+            logger.error(f"Market regime error: {e}")
+            return {"regime": "UNKNOWN", "score": 0, "bias": "NEUTRAL"}
+
+    # ------------------------------------------------------------------ #
+    # VIX SENTIMENT (replaces VIXSentimentAnalyzer.get_vix_sentiment)    #
+    # ------------------------------------------------------------------ #
+
+    def get_vix_sentiment(self) -> Optional[Dict]:
+        """
+        Returns VIX-based sentiment dict.
+        Mirrors VIXSentimentAnalyzer.get_vix_sentiment().
+        """
+        try:
+            df = self.get_vix_data(days=30)
+            if df is None or df.empty:
+                return None
+
+            close = df['Close'].dropna()
+            current_vix = float(close.iloc[-1])
+            vix_avg = float(close.mean())
+
+            from scipy import stats as sc_stats
+            vix_pct = float(sc_stats.percentileofscore(close, current_vix))
+
+            if current_vix < 12:
+                regime, sentiment, score = "LOW_VOLATILITY", "BULLISH", 5
+            elif current_vix < 16:
+                regime, sentiment, score = "LOW_VOLATILITY", "BULLISH", 3
+            elif current_vix < 20:
+                regime, sentiment, score = "NORMAL", "NEUTRAL", 0
+            elif current_vix < 25:
+                regime, sentiment, score = "ELEVATED", "CAUTIOUS", -3
+            else:
+                regime, sentiment, score = "HIGH_VOLATILITY", "BEARISH", -7
+
+            return {
+                "vix": current_vix,
+                "vix_avg": vix_avg,
+                "vix_percentile": vix_pct,
+                "regime": regime,
+                "sentiment": sentiment,
+                "score": score,
+            }
+
+        except Exception as e:
+            logger.debug(f"VIX sentiment error: {e}")
+            return None
+
+    # ------------------------------------------------------------------ #
+    # SECTOR STRENGTH (replaces SectorRotationAnalyzer)                  #
+    # ------------------------------------------------------------------ #
+
+    def get_all_sector_strengths(self) -> Dict[str, float]:
+        """
+        Returns {sector_key: 10d_return_%} for all sectors.
+        Mirrors SectorRotationAnalyzer.update_sector_strength().
+        """
+        strengths = {}
+        for sector_key in SECTOR_TO_INDEX:
+            try:
+                ret = self.get_sector_return_pct(sector_key, lookback_days=10)
+                if ret is not None:
+                    strengths[sector_key] = ret
+            except Exception:
+                pass
+        return strengths
+
+    def get_sector_strength_label(
+        self,
+        sector: str,
+        strengths: Optional[Dict[str, float]] = None,
+    ) -> Tuple[float, str]:
+        """
+        Map a human sector name (from fundamentals) to a strength label.
+        Returns (strength_value, 'STRONG'|'MODERATE'|'WEAK'|'NEUTRAL')
+        """
+        if strengths is None:
+            strengths = self.get_all_sector_strengths()
+
+        # Map human sector → sector key
+        sector_map = {
+            'Financial Services': 'FINANCIALS',
+            'Financial':          'FINANCIALS',
+            'Banks':              'BANKING',
+            'Banking':            'BANKING',
+            'Information Technology': 'IT',
+            'Technology':         'IT',
+            'Healthcare':         'PHARMA',
+            'Pharmaceuticals':    'PHARMA',
+            'Automobile':         'AUTO',
+            'Consumer Goods':     'FMCG',
+            'FMCG':               'FMCG',
+            'Metals':             'METAL',
+            'Metal':              'METAL',
+            'Real Estate':        'REALTY',
+            'Energy':             'ENERGY',
+            'Infrastructure':     'INFRA',
+            'Media':              'MEDIA',
+        }
+
+        key = sector_map.get(sector, sector.upper())
+        val = strengths.get(key, 0.0)
+
+        if val > 5:
+            label = "STRONG"
+        elif val > 0:
+            label = "MODERATE"
+        else:
+            label = "WEAK"
+
+        return val, label
+
+    # ------------------------------------------------------------------ #
+    # NIFTY RELATIVE STRENGTH (replaces RelativeStrengthCalculator)      #
+    # ------------------------------------------------------------------ #
+
+    def get_nifty_returns_series(self, lookback: int = 20) -> Optional[pd.Series]:
+        """Return Nifty 50 daily pct-change series for RS calculation."""
+        df = self.get_nifty50_df(days=lookback + 10)
+        if df is None:
+            return None
+        return df['Close'].pct_change().dropna()
+
+    def calculate_relative_strength(
+        self,
+        stock_df: pd.DataFrame,
+        lookback: int = 20,
+    ) -> Tuple[float, str]:
+        """
+        Calculate stock RS vs Nifty 50.
+        Mirrors RelativeStrengthCalculator.calculate_rs().
+        """
+        try:
+            nifty_returns = self.get_nifty_returns_series(lookback)
+            if nifty_returns is None or len(stock_df) < lookback:
+                return 0, "UNKNOWN"
+
+            stock_ret = stock_df['Close'].pct_change().tail(lookback)
+            stock_cum = float((1 + stock_ret).prod() - 1)
+            nifty_cum = float((1 + nifty_returns.tail(lookback)).prod() - 1)
+
+            if abs(nifty_cum) > 0.001:
+                rs = (stock_cum / nifty_cum) * 100
+            else:
+                rs = 100 if stock_cum > 0 else -100
+
+            if rs > 150:
+                label = "VERY_STRONG"
+            elif rs > 110:
+                label = "STRONG"
+            elif rs > 90:
+                label = "NEUTRAL"
+            elif rs > 50:
+                label = "WEAK"
+            else:
+                label = "VERY_WEAK"
+
+            return round(rs, 1), label
+
+        except Exception as e:
+            logger.debug(f"RS calc error: {e}")
+            return 0, "UNKNOWN"
+
+    # ------------------------------------------------------------------ #
+    # DETECT MARKET REGIME (for select_top_2_stocks)                      #
+    # ------------------------------------------------------------------ #
+
+    def detect_regime_for_selection(self) -> Tuple[str, Dict]:
+        """
+        Returns (regime_str, thresholds_dict) for select_top_2_stocks.
+        Replaces the old Nifty fetch call inside that function.
+        """
+        regime_data = self.get_market_regime()
+        regime = regime_data.get('regime', 'RANGE_BOUND')
+
+        # Map strong/weak variants to base regimes
+        if 'BULLISH' in regime:
+            base = 'TRENDING_UP'
+        elif 'BEARISH' in regime:
+            base = 'TRENDING_DOWN'
+        elif regime == 'HIGH_VOLATILITY':
+            base = 'HIGH_VOLATILITY'
+        else:
+            base = 'RANGE_BOUND'
+
+        thresholds = {
+            'TRENDING_UP':     {'min_confidence': 70, 'min_bt_wr': 55, 'min_score': 60,
+                                'prefer_side': 'LONG',
+                                'description': 'Trending Up — favour LONG positions'},
+            'TRENDING_DOWN':   {'min_confidence': 70, 'min_bt_wr': 55, 'min_score': 60,
+                                'prefer_side': 'SHORT',
+                                'description': 'Trending Down — favour SHORT positions'},
+            'RANGE_BOUND':     {'min_confidence': 75, 'min_bt_wr': 60, 'min_score': 65,
+                                'prefer_side': None,
+                                'description': 'Range-Bound — higher quality required'},
+            'HIGH_VOLATILITY': {'min_confidence': 80, 'min_bt_wr': 65, 'min_score': 70,
+                                'prefer_side': None,
+                                'description': 'High Volatility — very selective'},
+        }
+
+        return base, thresholds.get(base, thresholds['RANGE_BOUND'])
+
+
+# ============================================================================
+# MODULE-LEVEL SINGLETON
+# ============================================================================
+
+kite_provider = KiteDataProvider()
+
 import pandas as pd
 import numpy as np
 import requests
@@ -2150,11 +2916,12 @@ class VIXSentimentAnalyzer:
     def get_vix_sentiment() -> Optional[Dict]:
         """Get current VIX sentiment"""
         try:
-            vix = yf.download("^INDIAVIX", period="1mo", interval="1d", progress=False)
+            vix_df = kite_provider.get_vix_data(days=35)
             
-            if vix.empty:
+            if vix_df is None or vix_df.empty:
                 return None
             
+            vix = vix_df  # keep variable name for rest of the method
             current_vix = vix['Close'].iloc[-1]
             vix_avg = vix['Close'].mean()
             vix_percentile = stats.percentileofscore(vix['Close'], current_vix)
@@ -2214,10 +2981,10 @@ class MarketRegimeFilter:
             return cls._cache
         
         try:
-            # Download Nifty 50 data
-            nifty = yf.download("^NSEI", period="3mo", interval="1d", progress=False)
+            # Fetch Nifty 50 data via Kite
+            nifty = kite_provider.get_nifty50_df(days=90)
             
-            if nifty.empty or len(nifty) < 50:
+            if nifty is None or nifty.empty or len(nifty) < 50:
                 return {"regime": "UNKNOWN", "score": 0, "bias": "NEUTRAL"}
             
             close = nifty['Close']
@@ -2322,12 +3089,13 @@ class RelativeStrengthCalculator:
     
     @classmethod
     def _load_nifty(cls):
-        """Load Nifty data once"""
+        """Load Nifty data once — via Kite"""
         if cls._nifty_data is None:
             try:
-                cls._nifty_data = yf.download("^NSEI", period="3mo", interval="1d", progress=False)
-                if not cls._nifty_data.empty:
-                    cls._nifty_returns = cls._nifty_data['Close'].pct_change()
+                nifty_df = kite_provider.get_nifty50_df(days=90)
+                if nifty_df is not None and not nifty_df.empty:
+                    cls._nifty_data = nifty_df
+                    cls._nifty_returns = nifty_df['Close'].pct_change()
             except:
                 pass
     
@@ -2388,53 +3156,22 @@ class SectorRotationAnalyzer:
     """Analyze sector strength - FIXED VERSION WITH WORKING SYMBOLS"""
     
     def __init__(self):
-        # ✅ FIXED: Use Yahoo Finance compatible index symbols
-        self.sector_etfs = {
-            'BANKING': '^NSEBANK',          # Nifty Bank Index
-            'IT': '^CNXIT',                  # Nifty IT Index
-            'PHARMA': '^CNXPHARMA',          # Nifty Pharma Index
-            'AUTO': '^CNXAUTO',              # Nifty Auto Index
-            'FMCG': '^CNXFMCG',              # Nifty FMCG Index
-            'METAL': '^CNXMETAL',            # Nifty Metal Index
-            'REALTY': '^CNXREALTY',          # Nifty Realty Index
-            'ENERGY': '^CNXENERGY',          # Nifty Energy Index
-            'INFRA': '^CNXINFRA',            # Nifty Infra Index
-            'PSU_BANK': '^CNXPSUBANK',       # Nifty PSU Bank Index
-            'FINANCIALS': '^CNXFIN',         # Nifty Financial Services
-            'MEDIA': '^CNXMEDIA',            # Nifty Media Index
-        }
+        # Sector keys — Kite index tokens are handled inside kite_data_provider
         self.sector_strength = {}
         self._last_update = None
         self._cache_duration = 3600  # 1 hour cache
-    
+
     def update_sector_strength(self):
-        """Update relative strength of sectors - WITH ERROR HANDLING"""
+        """Update sector strength via Kite sector index data — yfinance removed"""
         import time as time_module
-        
-        # Use cache if fresh
+
         if self._last_update and (time_module.time() - self._last_update) < self._cache_duration:
             return
-        
+
         try:
-            for sector, ticker in self.sector_etfs.items():
-                try:
-                    data = yf.download(ticker, period="1mo", interval="1d", progress=False, timeout=10)
-                    if data is not None and not data.empty and len(data) >= 10:
-                        # Handle MultiIndex columns
-                        if isinstance(data.columns, pd.MultiIndex):
-                            data.columns = data.columns.get_level_values(0)
-                        
-                        if 'Close' in data.columns:
-                            close_col = data['Close'].dropna()
-                            if len(close_col) >= 10:
-                                returns = (float(close_col.iloc[-1]) / float(close_col.iloc[-10]) - 1) * 100
-                                self.sector_strength[sector] = returns
-                except Exception as e:
-                    # Silent fail - just skip this sector
-                    continue
-            
+            self.sector_strength = kite_provider.get_all_sector_strengths()
             self._last_update = time_module.time()
-            
+            logger.debug(f"Sector strengths updated: {len(self.sector_strength)} sectors")
         except Exception as e:
             logger.debug(f"Sector rotation update failed: {e}")
     
@@ -3317,16 +4054,13 @@ def get_fundamentals(ticker: str) -> Tuple[Optional[str], Optional[float]]:
         return _fundamentals_cache[ticker]
     
     try:
-        t = yf.Ticker(ticker)
-        info = t.info or {}
-        sector = info.get('sector')
-        pe = info.get('trailingPE')
-        
-        # Cache the result
+        # Use Kite for fundamentals — yfinance removed
+        clean = ticker.replace('.NS', '').replace('.BO', '')
+        sector, pe = kite_provider.get_fundamentals(clean)
+
         _fundamentals_cache[ticker] = (sector, pe)
-        
         return sector, pe
-        
+
     except Exception:
         _fundamentals_cache[ticker] = (None, None)
         return None, None
@@ -4124,9 +4858,8 @@ def build_cache(tickers: List[str]) -> Optional[pd.DataFrame]:
     successful_downloads = {}  # Track successful downloads to prevent duplicates
     
     def download_ticker(ticker):
-        """Download single ticker — Kite historical API first, yfinance fallback.
-        FIX: yfinance NSE data has known corporate-action & split issues.
-             Kite historical is authoritative for NSE; yfinance used only when Kite unavailable.
+        """Download single ticker — Kite only (yfinance removed).
+        Uses kite_session first, then kite_provider as fallback.
         """
         original_ticker = ticker
         base_ticker = ticker.replace('.NS', '').replace('.BO', '')
@@ -4151,30 +4884,14 @@ def build_cache(tickers: List[str]) -> Optional[pd.DataFrame]:
                         df = kite_df
                         test_ticker = base_ticker  # Kite uses clean symbol
         except Exception:
-            pass  # Kite unavailable — fall through to yfinance
+            pass  # kite_session unavailable — kite_provider fallback below
 
-        # ── PRIORITY 2: yfinance fallback ─────────────────────────────────────
+        # ── PRIORITY 2: kite_provider fallback (if kite_session not available) ──
         if df is None:
-            for attempt in range(3):
-                try:
-                    raw = yf.download(
-                        test_ticker,
-                        start=start_date,
-                        end=end_date,
-                        progress=False,
-                        auto_adjust=True,
-                        timeout=10,
-                        threads=False
-                    )
-                    if raw is not None and not raw.empty and len(raw) >= 60:
-                        df = raw
-                        break
-                    if attempt == 1:
-                        test_ticker = base_ticker + '.BO'
-                except Exception as e:
-                    if attempt < 2:
-                        time.sleep(1)
-                    continue
+            df = kite_provider.get_historical_df(base_ticker, days=LOOKBACK_DAYS)
+            if df is not None and len(df) >= 60:
+                df = df.reset_index()  # make Date a column to match kite_session output
+                test_ticker = base_ticker
         
         # Validate we got data
         if df is None or df.empty or len(df) < 60:
@@ -5793,19 +6510,21 @@ def select_top_2_stocks(results: list) -> list:
     # 🆕 STEP 0: DETECT MARKET REGIME
     # ═══════════════════════════════════════════════════════════════════════
     
-    print("\n[STEP 0] Detecting Market Regime...")
-    
-    # Fetch Nifty 50 data
+    print("\n[STEP 0] Detecting Market Regime (Kite)...")
+
     try:
-        nifty = yf.download('^NSEI', period='3mo', progress=False, auto_adjust=True)
-        regime = detect_market_regime(nifty)
+        nifty = kite_provider.get_nifty50_df(days=90)
+        if nifty is not None and not nifty.empty:
+            regime = detect_market_regime(nifty)
+        else:
+            regime = 'RANGE_BOUND'
         thresholds = get_regime_adjusted_thresholds(regime)
-        
+
         print(f"   🌍 Regime: {regime}")
         print(f"   📋 {thresholds['description']}")
         print(f"   🎯 Thresholds: Confidence ≥{thresholds['min_confidence']}%, "
               f"WR ≥{thresholds['min_bt_wr']}%, Score ≥{thresholds['min_score']}")
-        
+
     except Exception as e:
         logger.warning(f"Could not fetch market regime: {e} - using defaults")
         regime = 'RANGE_BOUND'
@@ -6321,7 +7040,7 @@ def main():
             print("❌ Failed to build price cache")
             return
 
-        # Fix tz-naive vs tz-aware mixed timestamps (Kite=aware, yfinance=naive)
+        # Fix tz-naive vs tz-aware mixed timestamps (Kite may return tz-aware)
     df_all['Date'] = pd.to_datetime(df_all['Date']).dt.tz_localize(None)
 
     # ========================================================================
@@ -6601,24 +7320,30 @@ def github_actions_main():
     try:
         logger.info("🚀 Starting stock scan...")
 
-        # ── Initialize Kite session so scanner uses Kite data (not Yahoo) ──
-        try:
-            from auto_token_refresh import refresh_token_auto
-            from kite_connector import kite_session
-            from config_kite import token_needs_refresh
+        # ── Ensure Kite is connected (kite_provider initialises at import) ────
+        if kite_provider.is_connected:
+            logger.info("✅ Kite connected — using Kite data for all historical requests")
+        else:
+            try:
+                from auto_token_refresh import refresh_token_auto
+                from config_kite import token_needs_refresh
 
-            if token_needs_refresh():
-                logger.info("🔄 Token expired — refreshing before scan...")
-                ok, msg = refresh_token_auto()
-                logger.info(f"Token refresh: {msg}")
+                if token_needs_refresh():
+                    logger.info("🔄 Token expired — refreshing before scan...")
+                    ok, msg = refresh_token_auto()
+                    logger.info(f"Token refresh: {msg}")
 
-            ok, msg = kite_session.initialize()
-            if ok:
-                logger.info(f"✅ Kite connected — will use Kite historical data")
-            else:
-                logger.warning(f"⚠️ Kite init failed ({msg}) — fallback to Yahoo Finance")
-        except Exception as e:
-            logger.warning(f"⚠️ Kite setup error: {e} — fallback to Yahoo Finance")
+                kite_provider._connect()
+
+                if kite_provider.is_connected:
+                    logger.info("✅ Kite reconnected successfully")
+                else:
+                    logger.critical("❌ Kite NOT connected — scan cannot proceed (no yfinance fallback)")
+                    raise RuntimeError("Kite not connected after refresh attempt")
+
+            except Exception as e:
+                logger.critical(f"❌ Kite connection failed: {e}")
+                raise
 
         # ✅ Run the main scanner
         results = main()
