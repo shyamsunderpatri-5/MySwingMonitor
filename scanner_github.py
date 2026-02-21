@@ -7954,7 +7954,7 @@ def _kite_connect_with_retry(max_attempts: int = 3, base_delay: float = 5.0) -> 
     return False
 
 
-
+def github_actions_main():
     """Main function optimized for GitHub Actions execution with Google Sheets integration"""
     
     logger.info("="*80)
