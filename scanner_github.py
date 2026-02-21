@@ -1640,7 +1640,7 @@ PRESETS = {
         # ✅ OPTIMIZED FOR 2-5 DAILY SIGNALS
         'min_confidence': 65,               # ✅ Already correct
         'min_turnover': 800_000,            # ✅ Already correct
-        'min_rr_ratio': 1.7,                # ✅ Already correct (you changed from 1.6 to 2.0)
+        'min_rr_ratio': 1.5,                # Lowered from 1.7 — 1.5 still positive-expectancy, less restrictive in compressed markets
         'min_volatility_pct': 0.005,        # ✅ Already correct
         'min_volume_ratio': 0.5,            # ✅ Already correct
         'rsi_range_long': (40, 62),         # ✅ Already correct
@@ -2389,7 +2389,11 @@ class PortfolioRiskManager:
             )
 
         # ── Check 3: Sector concentration ────────────────────────────────────
-        current_sector_pct = self.sector_exposure.get(sector, 0.0)
+        # If sector is None/UNKNOWN, treat as unique per-ticker
+        # so unknown stocks don't all pile into one bucket and trigger
+        # the 32% cap after just 3-4 stocks.
+        effective_sector = sector if sector and sector not in ('UNKNOWN', 'None', None) else f"_UNKNOWN_{ticker}"
+        current_sector_pct = self.sector_exposure.get(effective_sector, 0.0)
         new_sector_pct     = current_sector_pct + (position_value / self.capital)
         if new_sector_pct > MAX_SECTOR_EXPOSURE:
             return False, (
@@ -2417,9 +2421,12 @@ class PortfolioRiskManager:
         """Register a trade (new signal or existing open position)."""
         self.current_trades.append(trade)
         sector         = trade.get('sector', 'UNKNOWN')
+        ticker         = trade.get('ticker', '_unknown')
+        # Same effective_sector logic as can_add_trade
+        effective_sector = sector if sector and sector not in ('UNKNOWN', 'None', None) else f"_UNKNOWN_{ticker}"
         position_value = trade.get('position_value', 0)
-        self.sector_exposure[sector] = (
-            self.sector_exposure.get(sector, 0.0) + position_value / self.capital
+        self.sector_exposure[effective_sector] = (
+            self.sector_exposure.get(effective_sector, 0.0) + position_value / self.capital
         )
         self.total_risk     += trade.get('risk_amount', 0)
         self.total_deployed += position_value# ============================================================================
@@ -6175,10 +6182,39 @@ def hybrid_scan_universe(
             )
             
             if backtest_result:
-                if (backtest_result.win_rate >= PRESET['min_backtest_win_rate'] and
-                    backtest_result.profit_factor >= PRESET['min_profit_factor'] and
-                    backtest_result.max_drawdown <= PRESET['max_drawdown']):
-                    
+                # ── Regime-adjusted Phase 2 thresholds ──────────────────────
+                # In a SHORT-biased market, LONG setups historically have
+                # lower win rates (going against the trend). Rather than
+                # hard-blocking them, we apply relaxed thresholds and
+                # reduce confidence so only the best counter-trend signals
+                # survive to select_top_2. SHORT signals in a SHORT-biased
+                # market keep the full strict thresholds.
+                sig_side    = candidate.get('side', 'LONG').replace('_ALERT', '')
+                regime_bias = market_regime.get('bias', 'NEUTRAL')
+
+                if regime_bias == 'SHORT' and sig_side == 'LONG':
+                    # Counter-trend LONG in bearish market — relaxed bar
+                    req_wr  = max(50, PRESET['min_backtest_win_rate'] - 8)   # 58→50
+                    req_pf  = max(1.3, PRESET['min_profit_factor'] - 0.4)   # 1.7→1.3
+                    req_dd  = PRESET['max_drawdown'] + 5                     # 18→23
+                    regime_note = " [counter-trend, relaxed thresholds]"
+                elif regime_bias == 'LONG' and sig_side == 'SHORT':
+                    # Counter-trend SHORT in bullish market — relaxed bar
+                    req_wr  = max(50, PRESET['min_backtest_win_rate'] - 8)
+                    req_pf  = max(1.3, PRESET['min_profit_factor'] - 0.4)
+                    req_dd  = PRESET['max_drawdown'] + 5
+                    regime_note = " [counter-trend, relaxed thresholds]"
+                else:
+                    # Trend-aligned — full strict thresholds
+                    req_wr  = PRESET['min_backtest_win_rate']
+                    req_pf  = PRESET['min_profit_factor']
+                    req_dd  = PRESET['max_drawdown']
+                    regime_note = ""
+
+                if (backtest_result.win_rate >= req_wr and
+                    backtest_result.profit_factor >= req_pf and
+                    backtest_result.max_drawdown <= req_dd):
+
                     candidate['backtest'] = {
                         "win_rate": backtest_result.win_rate,
                         "profit_factor": backtest_result.profit_factor,
@@ -6187,13 +6223,21 @@ def hybrid_scan_universe(
                         "reliability_score": backtest_result.reliability_score,
                         "total_trades": backtest_result.total_trades,
                     }
-                    
+
                     backtest_boost = (backtest_result.reliability_score - 50) * 0.25
+                    # Apply counter-trend confidence penalty so these rank lower
+                    if regime_note:
+                        backtest_boost -= 10
                     candidate['confidence'] = min(100, candidate['confidence'] + backtest_boost)
                     candidate['backtest_validated'] = True
-                    
+                    logger.debug(f"  Phase 2 PASS {candidate['ticker']}{regime_note}: "
+                                 f"WR={backtest_result.win_rate:.0f}% PF={backtest_result.profit_factor:.2f}")
                     validated_results.append(candidate)
                 else:
+                    logger.debug(f"  Phase 2 FAIL {candidate['ticker']}: "
+                                 f"WR={backtest_result.win_rate:.0f}%<{req_wr} or "
+                                 f"PF={backtest_result.profit_factor:.2f}<{req_pf} or "
+                                 f"DD={backtest_result.max_drawdown:.0f}%>{req_dd}")
                     stats["full_backtest_fail"] += 1
             else:
                 candidate['backtest_validated'] = False
@@ -7703,15 +7747,21 @@ def _check_daily_loss_circuit_breaker() -> tuple:
             return None
 
         for row in rows[1:]:   # skip header
-            # Guard: row may be shorter than expected (empty trailing cells)
+            # Guard 1: row shorter than needed (Sheets trims trailing empty cols)
             if len(row) <= max(pnl_col, exit_time_col):
                 continue
 
             exit_time_raw = row[exit_time_col]
             pnl_raw       = row[pnl_col]
 
+            # Guard 2: explicitly skip empty/None Exit_Time before date parse
+            # This is the primary safeguard when Exit_Time col exists but is empty
+            if exit_time_raw is None or str(exit_time_raw).strip() in ('', 'None', '-'):
+                continue
+
             exit_date = _parse_exit_date(exit_time_raw)
-            if exit_date != today_date:
+            # Guard 3: skip if date unparseable or not today
+            if exit_date is None or exit_date != today_date:
                 continue
 
             # Parse P/L value
