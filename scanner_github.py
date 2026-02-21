@@ -5435,10 +5435,12 @@ def scan_ticker(
     # indicator work.  For ambiguous tickers we let them through; the final tag
     # in the result dict is applied as before.
     if CNC_LONG_ONLY:
-        regime_score = market_regime.get('score', 0)
-        if regime_score < -8:
+        regime_bias = market_regime.get('bias', 'NEUTRAL')
+        if regime_bias in ('SHORT',):
+            # Entire market is bearish — all signals would come out SHORT.
+            # Skip rather than waste a full scan cycle.
             stats["confidence_fail"] += 1
-            log_rejection("CNC_LONG_ONLY", f"Extreme bearish regime (score={regime_score}), skipping")
+            log_rejection("CNC_LONG_ONLY", "Market regime is SHORT-biased, no LONG signals possible")
             return None
     
     try:
