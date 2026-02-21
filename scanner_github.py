@@ -88,17 +88,21 @@ NSE_HOLIDAYS = {
     "2025-10-21",  # Diwali Balipratipada
     "2025-11-05",  # Prakash Gurpurb Sri Guru Nanak Dev Ji
     "2025-12-25",  # Christmas
-    # 2026
-    "2026-01-26",  # Republic Day
-    "2026-03-06",  # Mahashivratri (tentative)
-    "2026-03-20",  # Holi (tentative)
-    "2026-04-03",  # Good Friday (tentative)
-    "2026-04-14",  # Dr. Ambedkar Jayanti
-    "2026-04-30",  # Id-Ul-Fitr (tentative)
-    "2026-05-01",  # Maharashtra Day
-    "2026-08-15",  # Independence Day
-    "2026-10-02",  # Gandhi Jayanti
-    "2026-12-25",  # Christmas
+    # 2026 — sourced from NSE Circular NSE/CMTR/71775 (Dec 2025)
+    "2026-01-26",  # Republic Day (Monday)
+    "2026-03-03",  # Holi (Tuesday)           ← was wrongly listed as Mar-20
+    "2026-03-26",  # Shri Ram Navami (Thursday)    ← was MISSING
+    "2026-03-31",  # Mahavir Jayanti (Tuesday)     ← was MISSING
+    "2026-04-03",  # Good Friday (Friday)
+    "2026-04-14",  # Dr. Ambedkar Jayanti (Tuesday)
+    "2026-04-30",  # Id-Ul-Fitr / Eid (Thursday)
+    "2026-05-01",  # Maharashtra Day (Friday)
+    "2026-05-28",  # Bakri Id / Id-Ul-Zuha (Thursday)  ← was MISSING
+    "2026-06-26",  # Muharram (Friday)                  ← was MISSING
+    "2026-10-02",  # Gandhi Jayanti (Friday)
+    "2026-12-25",  # Christmas (Friday)
+    # NOTE: Aug 15 (Independence Day) falls on Saturday 2026 — weekend, no closure.
+    # NOTE: Diwali Laxmi Pujan Nov 8 falls on Sunday 2026 — Muhurat only, weekend.
 }
 
 
@@ -1721,11 +1725,74 @@ MIN_TURNOVER = PRESET['min_turnover']
 MIN_RR_RATIO = PRESET['min_rr_ratio']
 TOP_RESULTS = 10               # ✅ Changed from 20 to 15 (focus on top signals)
 
-# Account & Risk
-ACCOUNT_CAPITAL = 50_000
-RISK_PER_TRADE = 0.01
-MAX_CONCURRENT_TRADES = 3       # ✅ Changed from 5 to 4 (more focused)
-MAX_SECTOR_EXPOSURE = 0.32      # ✅ Changed from 0.35 to 0.32
+# ── Account & Risk ──────────────────────────────────────────────────────────
+# ACCOUNT_CAPITAL is read DYNAMICALLY from your Google Sheet (_Monitor tab,
+# cell B1) every time the scanner runs.
+# → Change it in the sheet today to 50k, tomorrow to 70k — scanner adapts.
+# → Fallback to 50,000 only if the sheet is unreachable or cell is empty.
+#
+# _Monitor sheet layout (set this up once in your Google Sheet):
+#   A1: ACCOUNT_CAPITAL    B1: 50000   ← edit B1 to change your capital
+#   A2: RISK_PER_TRADE     B2: 0.01    ← optional, edit to change risk %
+#
+_CAPITAL_FALLBACK = 50_000   # used only if Google Sheet is unreachable
+
+def _read_capital_from_sheet() -> float:
+    """
+    Read ACCOUNT_CAPITAL from _Monitor!B1 in your Google Sheet.
+    Returns the fallback value if anything goes wrong.
+    Runs once at startup so the whole scanner uses the live value.
+    """
+    try:
+        if not GOOGLE_SHEETS_CONFIG.get("enabled") or not GOOGLE_SHEETS_CONFIG.get("spreadsheet_id"):
+            logger.warning("Capital config: Google Sheets not configured — using fallback Rs.%s", _CAPITAL_FALLBACK)
+            return float(_CAPITAL_FALLBACK)
+
+        from google.oauth2.service_account import Credentials as _Creds
+        from googleapiclient.discovery import build as _build
+        import json as _json
+
+        cred_json = GOOGLE_SHEETS_CONFIG.get("credentials_json", "")
+        if not cred_json:
+            return float(_CAPITAL_FALLBACK)
+
+        creds   = _Creds.from_service_account_info(
+            _json.loads(cred_json),
+            scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
+        )
+        svc    = _build("sheets", "v4", credentials=creds)
+        result = svc.spreadsheets().values().get(
+            spreadsheetId=GOOGLE_SHEETS_CONFIG["spreadsheet_id"],
+            range="_Monitor!B1",
+            valueRenderOption="UNFORMATTED_VALUE"
+        ).execute()
+
+        values = result.get("values", [])
+        if not values or not values[0]:
+            logger.warning(
+                "WARNING: _Monitor!B1 is empty — using fallback Rs.%s. "
+                "Put your capital amount in cell B1 of the _Monitor sheet.",
+                _CAPITAL_FALLBACK
+            )
+            return float(_CAPITAL_FALLBACK)
+
+        capital = float(values[0][0])
+        if capital <= 0:
+            logger.warning("WARNING: _Monitor!B1 value <= 0 — using fallback Rs.%s", _CAPITAL_FALLBACK)
+            return float(_CAPITAL_FALLBACK)
+
+        logger.info("ACCOUNT_CAPITAL read from Google Sheet (_Monitor!B1): Rs.%.0f", capital)
+        return capital
+
+    except Exception as e:
+        logger.warning("Could not read capital from sheet (%s) — using fallback Rs.%s", e, _CAPITAL_FALLBACK)
+        return float(_CAPITAL_FALLBACK)
+
+
+# Read capital dynamically at scanner startup
+ACCOUNT_CAPITAL     = _read_capital_from_sheet()
+RISK_PER_TRADE      = 0.01
+MAX_SECTOR_EXPOSURE = 0.32      # Max 32% of capital in any single sector
 
 # Data Quality
 MAX_DATA_STALE_DAYS = 5         # ✅ Changed from 7 to 5 (fresher data)
@@ -2236,38 +2303,122 @@ class VolatilityRegimeFilter:
 # ============================================================================
 
 class PortfolioRiskManager:
-    """Manage portfolio-level risk"""
-    
+    """
+    Capital-aware portfolio risk manager.
+
+    [FIX RISK-2] Old logic used a fixed MAX_CONCURRENT_TRADES count (e.g. 3)
+    which had no relation to actual capital available.  New logic:
+
+      available_capital = ACCOUNT_CAPITAL - total_deployed_capital
+      → Only allow new trade if its position_value fits within available_capital
+      → Also enforces sector concentration and total risk % caps
+
+    This means:
+      • 50k capital, 30k deployed  → 20k free  → new signals sized to fit 20k
+      • 50k capital, 48k deployed  → 2k free   → blocks most new signals
+      • Capital correct in config  → everything works automatically
+    """
+
+    # Minimum free capital required to take any new position (10% of total)
+    MIN_FREE_CAPITAL_PCT = 0.10
+
     def __init__(self, capital: float):
-        self.capital = capital
-        self.current_trades = []
-        self.sector_exposure = {}
-        self.total_risk = 0.0
-    
+        self.capital           = capital
+        self.current_trades    = []
+        self.sector_exposure   = {}   # sector → fraction of capital deployed
+        self.total_risk        = 0.0  # sum of all risk_amount values
+        self.total_deployed    = 0.0  # sum of all position_value values
+
+    # ── Read-only helpers ────────────────────────────────────────────────────
+
+    @property
+    def available_capital(self) -> float:
+        """Capital not yet deployed in open trades."""
+        return max(0.0, self.capital - self.total_deployed)
+
+    @property
+    def deployed_pct(self) -> float:
+        """Fraction of capital currently deployed (0–1)."""
+        return self.total_deployed / self.capital if self.capital > 0 else 0.0
+
+    def available_capital_summary(self) -> str:
+        return (
+            f"Capital: ₹{self.capital:,.0f} | "
+            f"Deployed: ₹{self.total_deployed:,.0f} ({self.deployed_pct*100:.1f}%) | "
+            f"Available: ₹{self.available_capital:,.0f} | "
+            f"Open trades: {len(self.current_trades)}"
+        )
+
+    # ── Core check ───────────────────────────────────────────────────────────
+
     def can_add_trade(self, trade: Dict) -> Tuple[bool, str]:
-        """Check if trade can be added"""
-        
-        if len(self.current_trades) >= MAX_CONCURRENT_TRADES:
-            return False, "Max concurrent trades"
-        
-        sector = trade.get('sector', 'UNKNOWN')
-        current_sector_exposure = self.sector_exposure.get(sector, 0)
-        
-        if current_sector_exposure >= MAX_SECTOR_EXPOSURE:
-            return False, f"Max sector exposure ({sector})"
-        
-        trade_risk = trade.get('risk_amount', 0)
+        """
+        Returns (True, 'OK') only if ALL of the following pass:
+          1. Available capital >= position value of new trade
+          2. Available capital >= MIN_FREE_CAPITAL_PCT of total (safety buffer)
+          3. Sector exposure won't exceed MAX_SECTOR_EXPOSURE
+          4. Total portfolio risk won't exceed 5% of capital
+        """
+
+        position_value = trade.get('position_value', 0)
+        trade_risk     = trade.get('risk_amount', 0)
+        sector         = trade.get('sector', 'UNKNOWN')
+        ticker         = trade.get('ticker', '?')
+
+        # ── Check 1: Enough free capital for this position ───────────────────
+        if position_value > 0 and position_value > self.available_capital:
+            return False, (
+                f"Insufficient capital for {ticker}: "
+                f"needs ₹{position_value:,.0f}, "
+                f"only ₹{self.available_capital:,.0f} free "
+                f"(₹{self.total_deployed:,.0f} already deployed)"
+            )
+
+        # ── Check 2: Safety buffer — keep MIN_FREE_CAPITAL_PCT always free ───
+        min_free = self.capital * self.MIN_FREE_CAPITAL_PCT
+        capital_after = self.available_capital - position_value
+        if capital_after < min_free:
+            return False, (
+                f"Safety buffer breach for {ticker}: "
+                f"would leave only ₹{capital_after:,.0f} free "
+                f"(minimum buffer = ₹{min_free:,.0f})"
+            )
+
+        # ── Check 3: Sector concentration ────────────────────────────────────
+        current_sector_pct = self.sector_exposure.get(sector, 0.0)
+        new_sector_pct     = current_sector_pct + (position_value / self.capital)
+        if new_sector_pct > MAX_SECTOR_EXPOSURE:
+            return False, (
+                f"Sector limit for {ticker} ({sector}): "
+                f"would reach {new_sector_pct*100:.1f}% "
+                f"(max {MAX_SECTOR_EXPOSURE*100:.0f}%)"
+            )
+
+        # ── Check 4: Total portfolio risk cap (5% of capital) ────────────────
         if self.total_risk + trade_risk > self.capital * 0.05:
-            return False, "Max portfolio risk"
-        
-        return True, "OK"
-    
+            return False, (
+                f"Portfolio risk cap for {ticker}: "
+                f"total risk would be ₹{self.total_risk + trade_risk:,.0f} "
+                f"(max ₹{self.capital * 0.05:,.0f})"
+            )
+
+        return True, (
+            f"OK — ₹{self.available_capital - position_value:,.0f} "
+            f"will remain free after this trade"
+        )
+
+    # ── State update ─────────────────────────────────────────────────────────
+
     def add_trade(self, trade: Dict):
-        """Add trade to portfolio"""
+        """Register a trade (new signal or existing open position)."""
         self.current_trades.append(trade)
-        sector = trade.get('sector', 'UNKNOWN')
-        self.sector_exposure[sector] = self.sector_exposure.get(sector, 0) + trade.get('position_value', 0) / self.capital
-        self.total_risk += trade.get('risk_amount', 0)# ============================================================================
+        sector         = trade.get('sector', 'UNKNOWN')
+        position_value = trade.get('position_value', 0)
+        self.sector_exposure[sector] = (
+            self.sector_exposure.get(sector, 0.0) + position_value / self.capital
+        )
+        self.total_risk     += trade.get('risk_amount', 0)
+        self.total_deployed += position_value# ============================================================================
 # INSTITUTIONAL VOLUME ANALYZER
 # ============================================================================
 
@@ -3459,7 +3610,20 @@ class AdvancedBacktester:
         
         # ✅ FIX #3: Enter at NEXT bar's open (realistic)
         actual_entry = future_data.iloc[1]['Open']
-        TOTAL_COST_PCT = 0.21
+
+        # ── Realistic NSE transaction costs (round-trip) ─────────────────────
+        # CNC LONG (delivery):
+        #   STT buy+sell: 0.1%+0.1% | Exchange: 0.0069% | Stamp: 0.015% buy
+        #   GST on fees | Total round-trip: ~0.22%
+        # CNC SHORT alert (futures/options):
+        #   STT: 0.01% sell side only | Exchange: 0.0019% | Much lower
+        #   Total round-trip: ~0.05-0.08%
+        # We use 0.20% for LONG (conservative) and 0.08% for SHORT
+        TOTAL_COST_PCT = 0.20 if signal_type == "LONG" else 0.08
+
+        # Slippage: 0.05% extra for gap/impact cost on entry/exit
+        SLIPPAGE_PCT = 0.05
+        TOTAL_COST_PCT += SLIPPAGE_PCT   # 0.25% LONG, 0.13% SHORT
 
         # [FIX CRIT-2] Use the SAME dynamic stop-multiplier as TradeRule so the
         # simulated trade stop distance matches the live signal the user sees.
@@ -3544,19 +3708,25 @@ class AdvancedBacktester:
             exit_day = len(future_data) - 1
             exit_reason = "Time Exit"
         
-        # Calculate return based on ACTUAL entry
+        # Calculate return based on ACTUAL entry (costs already set above)
         if signal_type == "LONG":
             return_pct = ((exit_price - actual_entry) / actual_entry) * 100
-            return_pct = return_pct - 0.21
         else:
             return_pct = ((actual_entry - exit_price) / actual_entry) * 100
-            return_pct = return_pct - 0.21
-        
+
+        # Deduct realistic round-trip costs + slippage
+        return_pct = return_pct - TOTAL_COST_PCT
+
+        # return_dollars based on ACTUAL position size (entry * 1 share = per-share basis)
+        # Scaled to ₹10,000 notional position for meaningful expectancy figures
+        NOTIONAL_POSITION = 10_000
+        return_dollars = (return_pct / 100) * NOTIONAL_POSITION
+
         return {
             'entry_price': actual_entry,
             'exit_price': exit_price,
             'return_pct': return_pct,
-            'return_dollars': return_pct * 1000,
+            'return_dollars': return_dollars,
             'holding_days': exit_day - 1,  # Subtract entry day
             'exit_reason': exit_reason,
             'signal_type': signal_type
@@ -7123,7 +7293,22 @@ def main():
     sector_filter = SectorRotationAnalyzer() if USE_SECTOR_ROTATION else None
     vix_filter = VIXSentimentAnalyzer() if USE_VIX_SENTIMENT else None
     fibo_detector = FibonacciDetector() if USE_FIBONACCI_SCORING else None
-    portfolio_mgr = PortfolioRiskManager(ACCOUNT_CAPITAL) if USE_PORTFOLIO_RISK else None
+    # [FIX RISK-1] Use the pre-seeded manager (loaded from Google Sheets with real
+    # ACTIVE positions) if github_actions_main() prepared one. Otherwise fall back
+    # to a fresh empty instance (e.g. when running scanner standalone/locally).
+    if USE_PORTFOLIO_RISK:
+        import builtins as _builtins
+        portfolio_mgr = getattr(_builtins, '_seeded_portfolio_mgr', None)
+        if portfolio_mgr:
+            logger.info(
+                f"✅ Using pre-seeded PortfolioRiskManager "
+                f"({len(portfolio_mgr.current_trades)} real open positions loaded)"
+            )
+        else:
+            portfolio_mgr = PortfolioRiskManager(ACCOUNT_CAPITAL)
+            logger.info("ℹ️  PortfolioRiskManager: no pre-seeded data — starting empty (local run?)")
+    else:
+        portfolio_mgr = None
     mtf_analyzer = MultiTimeframeAnalyzer()
     
     if sector_filter:
@@ -7406,7 +7591,370 @@ Running on GitHub Actions ⚡
 # MODIFIED MAIN FUNCTION FOR GITHUB ACTIONS
 # ============================================================================
 
-def github_actions_main():
+def _check_daily_loss_circuit_breaker() -> tuple:
+    """
+    [FIX CB-1] Daily Loss Circuit Breaker — reads LIVE from Google Sheets PL tab.
+
+    Your PL sheet columns (confirmed from your workbook):
+      A: Ticker   B: Position   C: Entry_Price   D: Exit_Price
+      E: Quantity  F: P/L        G: Result        H: Exit_Reason
+      I: Exit_Time  (format: '2026-01-13 11:47:37' or Excel serial date)
+
+    Logic:
+      - Reads every row from the PL sheet via Google Sheets API
+      - Filters rows where Exit_Time is TODAY
+      - Sums the P/L column for those rows
+      - If total loss >= 3% of ACCOUNT_CAPITAL → block the scan
+
+    Returns (allowed: bool, reason: str)
+    """
+    DAILY_LOSS_LIMIT_PCT = 0.03                          # 3% hard stop
+    DAILY_LOSS_LIMIT_ABS = ACCOUNT_CAPITAL * DAILY_LOSS_LIMIT_PCT
+    PL_SHEET_NAME        = 'PL'                          # Tab name in your Google Sheet
+    today_str            = datetime.now().strftime('%Y-%m-%d')
+
+    try:
+        # ── Step 1: Connect to Google Sheets ────────────────────────────────
+        service = get_google_sheets_service()
+        if not service:
+            # Can't reach Sheets — don't block the scan, just warn
+            logger.warning("⚠️  Circuit breaker: Google Sheets unavailable — scan allowed")
+            return True, "Google Sheets unavailable — circuit breaker skipped (non-blocking)"
+
+        spreadsheet_id = GOOGLE_SHEETS_CONFIG['spreadsheet_id']
+        if not spreadsheet_id:
+            logger.warning("⚠️  Circuit breaker: spreadsheet_id not set — scan allowed")
+            return True, "Spreadsheet ID not configured — circuit breaker skipped"
+
+        # ── Step 2: Fetch ALL rows from PL sheet (cols A:I) ─────────────────
+        # Row 1 = headers, Row 2 onwards = formula rows or data
+        # We fetch A:I to get Ticker + P/L (col F) + Exit_Time (col I)
+        try:
+            result = service.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range=f'{PL_SHEET_NAME}!A:I',
+                valueRenderOption='UNFORMATTED_VALUE',   # numbers as numbers, not display text
+                dateTimeRenderOption='FORMATTED_STRING'  # dates as readable strings
+            ).execute()
+        except Exception as api_err:
+            logger.warning(f"⚠️  Circuit breaker: PL sheet read failed ({api_err}) — scan allowed")
+            return True, f"PL sheet read error (non-blocking): {api_err}"
+
+        rows = result.get('values', [])
+        if len(rows) < 2:
+            logger.info("⚡ Circuit breaker: PL sheet empty or header-only — scan allowed")
+            return True, "PL sheet has no trade data — circuit breaker passed"
+
+        # ── Step 3: Find column indices from the header row ─────────────────
+        # Headers have trailing spaces in your sheet e.g. 'Ticker ', 'P/L'
+        header = [str(h).strip() for h in rows[0]]
+
+        def col_idx(name):
+            """Return 0-based index of a column name, or -1 if not found."""
+            for i, h in enumerate(header):
+                if h.lower() == name.lower():
+                    return i
+            return -1
+
+        pnl_col      = col_idx('P/L')       # column F → index 5
+        exit_time_col = col_idx('Exit_Time') # column I → index 8
+        ticker_col    = col_idx('Ticker')    # column A → index 0
+
+        if pnl_col == -1 or exit_time_col == -1:
+            logger.warning(
+                f"⚠️  Circuit breaker: Could not find 'P/L' or 'Exit_Time' columns "
+                f"in PL sheet headers {header} — scan allowed"
+            )
+            return True, "PL sheet column mapping failed — circuit breaker skipped"
+
+        # ── Step 4: Sum today's P/L ─────────────────────────────────────────
+        todays_pnl    = 0.0
+        todays_trades = 0
+        today_date    = datetime.now().date()
+
+        def _parse_exit_date(raw):
+            """
+            Parse Exit_Time into a date object.
+            Google Sheets API (FORMATTED_STRING) returns dates in the sheet's
+            locale — Indian sheets typically use DD/MM/YYYY or D/M/YYYY.
+            Also handles ISO format YYYY-MM-DD just in case.
+            Returns None if unparseable.
+            """
+            if not raw or str(raw).strip() in ('', 'None'):
+                return None
+            s = str(raw).strip()
+            from datetime import date
+            # Try all common formats Google Sheets may return
+            for fmt in ('%d/%m/%Y %H:%M:%S', '%d/%m/%Y',
+                        '%m/%d/%Y %H:%M:%S', '%m/%d/%Y',
+                        '%Y-%m-%d %H:%M:%S', '%Y-%m-%d',
+                        '%d-%m-%Y %H:%M:%S', '%d-%m-%Y'):
+                try:
+                    return datetime.strptime(s[:len(fmt.replace('%d','01').replace('%m','01').replace('%Y','2000').replace('%H','00').replace('%M','00').replace('%S','00'))], fmt).date()
+                except ValueError:
+                    pass
+            # Last resort: try dateutil if available
+            try:
+                from dateutil import parser as _dp
+                return _dp.parse(s).date()
+            except Exception:
+                pass
+            return None
+
+        for row in rows[1:]:   # skip header
+            # Guard: row may be shorter than expected (empty trailing cells)
+            if len(row) <= max(pnl_col, exit_time_col):
+                continue
+
+            exit_time_raw = row[exit_time_col]
+            pnl_raw       = row[pnl_col]
+
+            exit_date = _parse_exit_date(exit_time_raw)
+            if exit_date != today_date:
+                continue
+
+            # Parse P/L value
+            try:
+                pnl_value = float(str(pnl_raw).replace(',', '').replace('₹', '').strip())
+            except (ValueError, TypeError):
+                logger.debug(f"Circuit breaker: skipping unparseable P/L value '{pnl_raw}'")
+                continue
+
+            todays_pnl   += pnl_value
+            todays_trades += 1
+
+            ticker = row[ticker_col] if len(row) > ticker_col else '?'
+            logger.info(f"⚡ Circuit breaker: found today trade — "
+                        f"{ticker} P/L = ₹{pnl_value:+,.2f}")
+
+        # ── Step 5: Decision ────────────────────────────────────────────────
+        if todays_trades == 0:
+            logger.info(f"⚡ Circuit breaker: no closed trades today ({today_str}) — scan allowed")
+            return True, f"No closed trades today — circuit breaker passed"
+
+        logger.info(f"⚡ Circuit breaker: {todays_trades} trade(s) today, "
+                    f"total P/L = ₹{todays_pnl:+,.2f} "
+                    f"(limit = ₹{-DAILY_LOSS_LIMIT_ABS:,.2f})")
+
+        if todays_pnl <= -DAILY_LOSS_LIMIT_ABS:
+            msg = (
+                f"🚨 CIRCUIT BREAKER TRIGGERED: Today's realized loss "
+                f"₹{abs(todays_pnl):,.0f} has hit the {DAILY_LOSS_LIMIT_PCT*100:.0f}% "
+                f"daily limit (₹{DAILY_LOSS_LIMIT_ABS:,.0f} on ₹{ACCOUNT_CAPITAL:,} capital). "
+                f"Scan blocked to protect remaining capital."
+            )
+            logger.critical(msg)
+            return False, msg
+
+        return True, (
+            f"Circuit breaker passed — today P/L: ₹{todays_pnl:+,.2f} "
+            f"across {todays_trades} trade(s) "
+            f"(limit: ₹{-DAILY_LOSS_LIMIT_ABS:,.2f})"
+        )
+
+    except Exception as e:
+        # Safety net — never block the scan due to an internal CB error
+        logger.warning(f"⚠️  Circuit breaker unexpected error: {e} — scan allowed")
+        return True, f"Circuit breaker error (non-blocking): {e}"
+
+
+def _load_active_positions_into_risk_manager(portfolio_mgr: 'PortfolioRiskManager') -> str:
+    """
+    [FIX RISK-1] Seeds PortfolioRiskManager with your REAL open positions
+    from the Google Sheet's 'Portfolio' tab BEFORE the scan starts.
+
+    WHY THIS MATTERS:
+    Without this, PortfolioRiskManager starts empty every run.
+    So can_add_trade() checks 0 open positions against MAX_CONCURRENT_TRADES=3
+    — completely ignoring your 12 actual ACTIVE trades.
+    This means the sector exposure cap and max-position cap are both blind.
+
+    HOW IT WORKS:
+    Reads Portfolio sheet → filters rows where Status == 'ACTIVE'
+    → calls portfolio_mgr.add_trade() for each one to pre-populate
+    the risk manager's state before main() scans new signals.
+
+    Portfolio sheet columns (from your workbook):
+      A:Ticker  B:Position  C:Entry_Price  D:Quantity  E:Stop_Loss
+      F:Target_1  G:Target_2  H:Entry_Date  I:Status  J:Notes
+
+    Returns a summary string for logging.
+    """
+    PORTFOLIO_SHEET = 'Portfolio'
+
+    try:
+        service = get_google_sheets_service()
+        if not service:
+            logger.warning("⚠️  Risk seeding: Google Sheets unavailable — portfolio_mgr stays empty")
+            return "Google Sheets unavailable — risk manager not seeded"
+
+        spreadsheet_id = GOOGLE_SHEETS_CONFIG['spreadsheet_id']
+        if not spreadsheet_id:
+            return "Spreadsheet ID not set — risk manager not seeded"
+
+        # ── Fetch Portfolio sheet ────────────────────────────────────────────
+        result = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=f'{PORTFOLIO_SHEET}!A:J',
+            valueRenderOption='UNFORMATTED_VALUE',
+            dateTimeRenderOption='FORMATTED_STRING'
+        ).execute()
+
+        rows = result.get('values', [])
+        if len(rows) < 2:
+            return "Portfolio sheet empty — risk manager not seeded"
+
+        # ── Map headers (strip trailing spaces your sheet has) ───────────────
+        header = [str(h).strip() for h in rows[0]]
+
+        def ci(name):
+            """Column index by name."""
+            for i, h in enumerate(header):
+                if h.lower() == name.lower():
+                    return i
+            return -1
+
+        col_ticker   = ci('Ticker')
+        col_position = ci('Position')
+        col_entry    = ci('Entry_Price')
+        col_qty      = ci('Quantity')
+        col_sl       = ci('Stop_Loss')
+        col_status   = ci('Status')
+
+        if any(c == -1 for c in [col_ticker, col_entry, col_qty, col_sl, col_status]):
+            logger.warning(f"⚠️  Risk seeding: missing columns in Portfolio sheet headers: {header}")
+            return "Column mapping failed — risk manager not seeded"
+
+        # ── Seed the risk manager with each ACTIVE trade ─────────────────────
+        seeded = 0
+        skipped = 0
+
+        # Sector lookup for existing positions (best-effort, won't block if unknown)
+        TICKER_SECTOR_MAP = {
+            # Pharma
+            'CIPLA':'PHARMA','GLENMARK':'PHARMA','AJANTPHARM':'PHARMA',
+            'LAURUSLABS':'PHARMA','TORNTPHARM':'PHARMA',
+            # FMCG / Consumer
+            'JYOTHYLAB':'FMCG','CASTROLIND':'FMCG','CLEAN':'FMCG',
+            # Chemicals / Industrials
+            'BASF':'FMCG','CARBORUNIV':'METAL','TATACHEM':'FMCG',
+            # Finance / Housing
+            'BAJAJHFL':'FINANCIALS','SBILIFE':'FINANCIALS',
+            # Energy
+            'IGL':'ENERGY',
+            # Auto / Engineering
+            'ARE&M':'AUTO','EXIDEIND':'AUTO',
+        }
+
+        for row in rows[1:]:
+            if len(row) <= max(col_ticker, col_entry, col_qty, col_sl, col_status):
+                skipped += 1
+                continue
+
+            status = str(row[col_status]).strip().upper()
+            if status != 'ACTIVE':
+                continue   # only seed ACTIVE trades
+
+            try:
+                ticker_sym  = str(row[col_ticker]).strip()
+                entry_price = float(row[col_entry])
+                qty         = float(row[col_qty])
+                sl          = float(row[col_sl])
+                side        = str(row[col_position]).strip().upper()  # LONG / SHORT
+
+                position_value = entry_price * qty
+                risk_per_share = abs(entry_price - sl)
+                risk_amount    = risk_per_share * qty
+                sector         = TICKER_SECTOR_MAP.get(ticker_sym, 'UNKNOWN')
+
+                portfolio_mgr.add_trade({
+                    'ticker':         ticker_sym,
+                    'side':           side,
+                    'position_value': position_value,
+                    'risk_amount':    risk_amount,
+                    'sector':         sector,
+                })
+                seeded += 1
+                logger.info(f"  📌 Seeded: {ticker_sym} {side} "
+                            f"₹{position_value:,.0f} risk=₹{risk_amount:,.0f} sector={sector}")
+
+            except (ValueError, TypeError, IndexError) as row_err:
+                skipped += 1
+                logger.debug(f"Risk seeding: skipped row {row} — {row_err}")
+
+        summary = (
+            f"Risk manager seeded: {seeded} ACTIVE positions loaded "
+            f"({skipped} rows skipped). "
+            f"Open trades loaded: {seeded}. "
+            f"Sector exposure: {dict(portfolio_mgr.sector_exposure)}"
+        )
+        logger.info(f"✅ {summary}")
+        return summary
+
+    except Exception as e:
+        logger.warning(f"⚠️  Risk seeding error: {e} — portfolio_mgr stays empty")
+        return f"Risk seeding failed (non-blocking): {e}"
+
+
+def _kite_connect_with_retry(max_attempts: int = 3, base_delay: float = 5.0) -> bool:
+    """
+    [FIX RETRY-1] Kite connection with exponential-backoff retry.
+
+    Handles the most common Kite transient errors:
+      - TokenException  → token expired → trigger auto-refresh and retry
+      - NetworkException / requests.Timeout → transient; wait and retry
+      - DataException   → usually bad instrument master; reload instruments
+
+    Returns True if connected, False if all attempts exhausted.
+    """
+    import time as _time
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            logger.info(f"🔌 Kite connect attempt {attempt}/{max_attempts}…")
+            kite_provider._connect()
+
+            if kite_provider.is_connected:
+                logger.info(f"✅ Kite connected on attempt {attempt}")
+                return True
+
+            # Not connected — try token refresh before next attempt
+            logger.warning(f"⚠️  Kite not connected (attempt {attempt})")
+            try:
+                from auto_token_refresh import refresh_token_auto
+                from config_kite import token_needs_refresh
+                if token_needs_refresh():
+                    logger.info("🔄 Token expired — refreshing…")
+                    ok, msg = refresh_token_auto()
+                    logger.info(f"Token refresh result: {msg}")
+            except ImportError:
+                logger.warning("auto_token_refresh not available — skipping refresh")
+            except Exception as ref_err:
+                logger.warning(f"Token refresh error: {ref_err}")
+
+        except Exception as e:
+            err_type = type(e).__name__
+            logger.warning(f"⚠️  Kite connect error on attempt {attempt}: [{err_type}] {e}")
+
+            # For TokenException, always attempt a refresh before retry
+            if 'Token' in err_type or 'token' in str(e).lower():
+                try:
+                    from auto_token_refresh import refresh_token_auto
+                    ok, msg = refresh_token_auto()
+                    logger.info(f"Token refresh (error recovery): {msg}")
+                except Exception:
+                    pass
+
+        if attempt < max_attempts:
+            delay = base_delay * (2 ** (attempt - 1))   # 5s, 10s, 20s …
+            logger.info(f"⏳ Retrying in {delay:.0f}s…")
+            _time.sleep(delay)
+
+    logger.critical(f"❌ Kite connection failed after {max_attempts} attempts")
+    return False
+
+
+
     """Main function optimized for GitHub Actions execution with Google Sheets integration"""
     
     logger.info("="*80)
@@ -7423,30 +7971,85 @@ def github_actions_main():
     try:
         logger.info("🚀 Starting stock scan...")
 
-        # ── Ensure Kite is connected (kite_provider initialises at import) ────
-        if kite_provider.is_connected:
-            logger.info("✅ Kite connected — using Kite data for all historical requests")
+        # ── [FIX CB-1] Daily loss circuit breaker ─────────────────────────────
+        cb_allowed, cb_reason = _check_daily_loss_circuit_breaker()
+        if not cb_allowed:
+            logger.critical("="*80)
+            logger.critical("🚨 SCAN ABORTED BY DAILY LOSS CIRCUIT BREAKER")
+            logger.critical(cb_reason)
+            logger.critical("="*80)
+            # Send alert email so you know the bot self-stopped
+            if EMAIL_CONFIG['enabled'] and EMAIL_CONFIG['sender_email']:
+                try:
+                    msg = MIMEText(
+                        f"NSE Scanner v8.5 — CIRCUIT BREAKER TRIGGERED\n\n"
+                        f"{cb_reason}\n\n"
+                        f"The scanner has self-stopped to protect your capital.\n"
+                        f"Resume trading manually after reviewing today's P&L."
+                    )
+                    msg['Subject'] = "🚨 NSE Scanner — Circuit Breaker Triggered"
+                    msg['From']    = EMAIL_CONFIG['sender_email']
+                    msg['To']      = EMAIL_CONFIG['recipient_email']
+                    with smtplib.SMTP(EMAIL_CONFIG['smtp_server'],
+                                      EMAIL_CONFIG['smtp_port']) as server:
+                        server.starttls()
+                        server.login(EMAIL_CONFIG['sender_email'],
+                                     EMAIL_CONFIG['sender_password'])
+                        server.send_message(msg)
+                    logger.info("📧 Circuit breaker alert email sent")
+                except Exception as mail_err:
+                    logger.warning(f"Circuit breaker email failed: {mail_err}")
+            return 1   # Exit non-zero so GitHub Actions marks the job as failed
+
+        logger.info(f"⚡ Circuit breaker: {cb_reason}")
+
+        # ── [FIX RETRY-1] Kite connection with exponential-backoff retry ──────
+        if not kite_provider.is_connected:
+            connected = _kite_connect_with_retry(max_attempts=3, base_delay=5.0)
+            if not connected:
+                logger.critical("❌ Kite NOT connected after all retry attempts — scan aborted")
+                raise RuntimeError("Kite not connected after 3 retry attempts")
         else:
-            try:
-                from auto_token_refresh import refresh_token_auto
-                from config_kite import token_needs_refresh
+            logger.info("✅ Kite already connected — skipping retry logic")
 
-                if token_needs_refresh():
-                    logger.info("🔄 Token expired — refreshing before scan...")
-                    ok, msg = refresh_token_auto()
-                    logger.info(f"Token refresh: {msg}")
+        # ── [FIX RISK-1] Seed PortfolioRiskManager with real open positions ──
+        # portfolio_mgr is created inside main() — we pre-seed it here via a
+        # temporary instance that main() will mirror when USE_PORTFOLIO_RISK=True.
+        # This ensures can_add_trade() knows about your existing ACTIVE trades
+        # BEFORE scanning new signals, so the max-position + sector caps work.
+        if USE_PORTFOLIO_RISK:
+            logger.info("="*80)
+            logger.info("📊 LOADING ACTIVE POSITIONS INTO RISK MANAGER...")
+            logger.info("="*80)
+            _temp_mgr = PortfolioRiskManager(ACCOUNT_CAPITAL)
+            seed_summary = _load_active_positions_into_risk_manager(_temp_mgr)
+            logger.info(seed_summary)
 
-                kite_provider._connect()
+            # ── Capital availability report ──────────────────────────────────
+            logger.info("💰 CAPITAL SNAPSHOT:")
+            logger.info(f"   {_temp_mgr.available_capital_summary()}")
 
-                if kite_provider.is_connected:
-                    logger.info("✅ Kite reconnected successfully")
-                else:
-                    logger.critical("❌ Kite NOT connected — scan cannot proceed (no yfinance fallback)")
-                    raise RuntimeError("Kite not connected after refresh attempt")
-
-            except Exception as e:
-                logger.critical(f"❌ Kite connection failed: {e}")
-                raise
+            if _temp_mgr.total_deployed > _temp_mgr.capital:
+                logger.warning(
+                    f"⚠️  ACCOUNT_CAPITAL (₹{_temp_mgr.capital:,.0f}) is LESS than "
+                    f"deployed capital (₹{_temp_mgr.total_deployed:,.0f}). "
+                    f"Please update ACCOUNT_CAPITAL in config to your real capital!"
+                )
+            elif _temp_mgr.available_capital < _temp_mgr.capital * _temp_mgr.MIN_FREE_CAPITAL_PCT:
+                logger.warning(
+                    f"⚠️  Only ₹{_temp_mgr.available_capital:,.0f} free — "
+                    f"below 10% safety buffer. Most new signals will be blocked."
+                )
+            else:
+                logger.info(
+                    f"✅ ₹{_temp_mgr.available_capital:,.0f} available for new signals "
+                    f"({100 - _temp_mgr.deployed_pct*100:.1f}% of capital free)"
+                )
+            logger.info("="*80)
+            # Pass the pre-seeded state into the module-level portfolio_mgr
+            # that main() will use (same object reference is picked up inside main)
+            import builtins as _builtins
+            _builtins._seeded_portfolio_mgr = _temp_mgr
 
         # ✅ Run the main scanner
         results = main()
