@@ -286,12 +286,16 @@ def format_sheet_row(signal_data, entry_date):
                 rr_ratio = 0
         
         # Create notes from additional data
-        notes = f"Confidence: {confidence}%, R:R: {rr_ratio}"
+        # Mark SHORT_ALERT signals clearly so you know these are manual-only
+        # (cannot be placed as CNC orders — use Kite app / F&O manually)
+        alert_tag = " ⚠️ SHORT_ALERT: Manual/F&O only" if str(position).upper() == "SHORT_ALERT" else ""
+        position_display = "SHORT" if str(position).upper() == "SHORT_ALERT" else position
+        notes = f"Confidence: {confidence}%, R:R: {rr_ratio}{alert_tag}"
         
         # Format row
         row = [
             ticker,
-            position,
+            position_display,
             round(float(entry_price), 2) if entry_price else 0,
             quantity,
             round(float(stop_loss), 2) if stop_loss else 0,
@@ -5595,23 +5599,20 @@ def scan_ticker(
         return None
 
     # =========================================================================
-    # STEP 1a: [FIX MAJ-6] CNC_LONG_ONLY — skip SHORT tickers EARLY
+    # STEP 1a: CNC_LONG_ONLY — behaviour when market is SHORT-biased
     # =========================================================================
-    # Old code only tagged side="SHORT_ALERT" at the very end of scan_ticker()
-    # AFTER running all indicators, backtest, VIX, Fibonacci etc. — wasting
-    # significant CPU on every short candidate.  We still need the final
-    # tagging for informational display, but we can skip any ticker whose ONLY
-    # viable side is SHORT (detected cheaply from regime bias) before doing any
-    # indicator work.  For ambiguous tickers we let them through; the final tag
-    # in the result dict is applied as before.
-    if CNC_LONG_ONLY:
-        regime_bias = market_regime.get('bias', 'NEUTRAL')
-        if regime_bias in ('SHORT',):
-            # Entire market is bearish — all signals would come out SHORT.
-            # Skip rather than waste a full scan cycle.
-            stats["confidence_fail"] += 1
-            log_rejection("CNC_LONG_ONLY", "Market regime is SHORT-biased, no LONG signals possible")
-            return None
+    # When CNC_LONG_ONLY=True AND market is SHORT-biased:
+    # OLD (broken): hard-blocked ALL 498 stocks at step 1 → 0 signals every day
+    #   in a bearish market, which is exactly when shorts are most valuable.
+    # NEW (fixed): let the scan run fully for ALL stocks.
+    #   SHORT signals → tagged side="SHORT_ALERT" at result build (step 25).
+    #   These still appear in your email + Google Sheet as reference signals
+    #   so you can trade them manually via Kite app / F&O as you see fit.
+    #   LONG signals in a SHORT-biased market still get a confidence penalty
+    #   (applied in score_signal) so only the best counter-trend setups pass.
+    # → No more 0-signal days just because the market is bearish.
+    # (The SHORT_ALERT tag is still applied at the result dict below so
+    #  the gatekeeper / Google Sheets integration stays unchanged.)
     
     try:
         # =====================================================================
