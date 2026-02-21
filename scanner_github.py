@@ -1,59 +1,4 @@
 
-"""
-NSE SWING SCANNER v8.5 - GITHUB ACTIONS VERSION  [PRODUCTION FIXED]
-=====================================================================
-Safe for real-money swing trading.  All critical, major and minor bugs
-from code-review applied.  DO NOT revert any section marked [FIX].
-
-FIXES APPLIED
-─────────────
-[CRIT-1] format_sheet_row() had _ACCOUNT_CAPITAL = 50_000 HARDCODED
-         inside the function.  If you ever changed the global
-         ACCOUNT_CAPITAL the Google Sheets qty calculation would silently
-         diverge.  Removed the local constant; function now uses the
-         module-level ACCOUNT_CAPITAL (single source of truth).
-
-[CRIT-2] _simulate_trade() used atr * 1.5 for the stop distance on
-         EVERY stock regardless of volatility.  TradeRule.__init__()
-         already selects 1.2 / 1.5 / 2.0 based on ATR-%.  The backtest
-         now calls a shared static method _get_stop_multiplier() so
-         simulated trades match the live signals exactly.  mini_backtest()
-         had the same hardcoded 1.5 — also fixed.
-
-[CRIT-3] entry_date was always "tomorrow" with no check for weekends or
-         NSE holidays.  If the scanner runs on a Friday it would write
-         Saturday as the entry date in Google Sheets.  Fixed with
-         get_next_trading_day() that skips weekends + full 2025-2026
-         NSE holiday calendar.
-
-[MAJ-4]  USE_MONTE_CARLO was False.  Enabled — adds risk-of-ruin
-         check before a signal reaches the sheet.
-
-[MAJ-5]  WALK_FORWARD_PERIODS was 3.  Raised to 5 for stronger
-         out-of-sample validation across more market cycles.
-
-[MAJ-6]  CNC_LONG_ONLY enforcement happened only at the very END of
-         scan_ticker() after expensive scoring, VIX, Fibonacci, and
-         backtest had all run.  Wasted CPU on every SHORT stock.
-         Now enforced at Step 1a (immediately after regime check), so
-         SHORT stocks are skipped early.  SHORT_ALERT tagging still
-         applied in the result dict for informational display.
-
-[MAJ-7]  PortfolioRiskManager.can_add_trade() was commented out in
-         scan_ticker() AND portfolio_mgr.add_trade() was commented out
-         in hybrid_scan_universe().  Both blocks are now active — the
-         portfolio-level sector-exposure cap works again.
-
-[MIN-8]  calculate_composite_score() normalized against max_score but
-         that variable kept growing with each if-block, so early-path
-         divisions returned inflated ratios.  Fixed: the function now
-         uses a fixed TOTAL_MAX_SCORE = 100 denominator (sum of all
-         category weights).
-
-[MIN-9]  NSE holiday calendar guard added.  get_next_trading_day()
-         covers 2025-2026 market closures.
-"""
-
 import sys
 import os
 import io
@@ -5490,12 +5435,10 @@ def scan_ticker(
     # indicator work.  For ambiguous tickers we let them through; the final tag
     # in the result dict is applied as before.
     if CNC_LONG_ONLY:
-        regime_bias = market_regime.get('bias', 'NEUTRAL')
-        if regime_bias in ('SHORT',):
-            # Entire market is bearish — all signals would come out SHORT.
-            # Skip rather than waste a full scan cycle.
+        regime_score = market_regime.get('score', 0)
+        if regime_score < -8:
             stats["confidence_fail"] += 1
-            log_rejection("CNC_LONG_ONLY", "Market regime is SHORT-biased, no LONG signals possible")
+            log_rejection("CNC_LONG_ONLY", f"Extreme bearish regime (score={regime_score}), skipping")
             return None
     
     try:
