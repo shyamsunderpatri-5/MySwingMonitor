@@ -189,6 +189,9 @@ def format_sheet_row(signal_data, entry_date):
                    signal_data.get('Side', '') or 
                    signal_data.get('Signal', '') or 
                    signal_data.get('Position', 'N/A'))
+        # Guard against pandas NaN values (empty CSV cells become float NaN)
+        if not position or str(position).strip() in ('nan', 'None', '', 'N/A'):
+            position = 'N/A'
         
         # Entry Price - Try multiple possible column names
         entry_price = (signal_data.get('price', 0) or          # ← MOST IMPORTANT: lowercase!
@@ -279,9 +282,9 @@ def format_sheet_row(signal_data, entry_date):
         tier     = signal_data.get('tier', signal_data.get('Tier', 'N/A'))
         setup    = signal_data.get('setup_type', signal_data.get('Setup', 'N/A'))
         sector   = signal_data.get('sector', signal_data.get('Sector', 'N/A'))
-        side_raw = str(signal_data.get('side', 'N/A'))
-        side_display = side_raw.replace('_ALERT', '')  # LONG or SHORT
-        short_alert  = 'ALERT' in side_raw.upper()
+        # Derive side_display from already-computed position (fixes N/A bug)
+        side_display = str(position).replace('_ALERT', '')  # LONG or SHORT
+        short_alert  = 'ALERT' in str(position).upper()
         alert_note   = ' | ⚠️ SHORT via F&O/Options only' if short_alert else ''
 
         notes = (
