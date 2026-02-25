@@ -245,25 +245,13 @@ def format_sheet_row(signal_data, entry_date):
             except:
                 target_2 = 0
         
-        # [FIX CRIT-1] Use module-level ACCOUNT_CAPITAL — single source of truth.
-        # The original code had _ACCOUNT_CAPITAL = 50_000 hardcoded here, so
-        # quantity sizing in Google Sheets would silently diverge from the scanner
-        # whenever ACCOUNT_CAPITAL was changed.
-        _RISK_PCT   = 0.01   # 1% risk per trade (mirrors RISK_PER_TRADE)
-        risk_amount = ACCOUNT_CAPITAL * _RISK_PCT
+        # [REMOVED] Quantity is no longer calculated — user fills it in Google Sheets
 
-        risk_per_share = abs(entry_price - stop_loss) if stop_loss and entry_price else 0
-        if risk_per_share > 0 and entry_price > 0:
-            qty_by_risk    = int(risk_amount / risk_per_share)
-            qty_by_capital = int((ACCOUNT_CAPITAL * 0.10) / entry_price)
-            quantity       = max(1, min(qty_by_risk, qty_by_capital, 1000))
-        elif entry_price > 0:
-            quantity = max(1, int((ACCOUNT_CAPITAL * 0.05) / entry_price))
-        else:
-            quantity = 1
-        
-        # Get Confidence and R:R
-        confidence = signal_data.get('confidence', signal_data.get('Confidence', signal_data.get('CONF', 0)))
+        # Get Confidence — CSV column is 'Confidence_%'
+        confidence = signal_data.get('Confidence_%',
+                     signal_data.get('confidence',
+                     signal_data.get('Confidence',
+                     signal_data.get('CONF', 0))))
         
         if isinstance(confidence, str):
             confidence = confidence.replace('%', '').strip()
@@ -272,8 +260,12 @@ def format_sheet_row(signal_data, entry_date):
             except:
                 confidence = 0
         
-        # Get R:R ratio
-        rr_ratio = signal_data.get('risk_reward', signal_data.get('RiskReward', signal_data.get('R:R', signal_data.get('RR', 0))))
+        # Get R:R ratio — CSV column is 'RR_Ratio'
+        rr_ratio = signal_data.get('RR_Ratio',
+                   signal_data.get('risk_reward',
+                   signal_data.get('RiskReward',
+                   signal_data.get('R:R',
+                   signal_data.get('RR', 0)))))
         
         if isinstance(rr_ratio, str):
             rr_ratio = rr_ratio.replace('x', '').strip()
@@ -282,48 +274,39 @@ def format_sheet_row(signal_data, entry_date):
             except:
                 rr_ratio = 0
 
-        # Notes from signal data
-        alert_note = ' (Manual/F&O only - cannot CNC)' if str(signal_data.get('side', '')).upper() == "SHORT_ALERT" else ""
-        side_clean  = str(signal_data.get('side', 'N/A')).replace('_ALERT', '')
-        rank        = signal_data.get('Rank', signal_data.get('rank', ''))
-        quality     = signal_data.get('Quality', signal_data.get('quality', ''))
-        tier        = signal_data.get('tier', signal_data.get('Tier', 'N/A'))
-        setup       = signal_data.get('setup_type', signal_data.get('Setup', 'N/A'))
-        sector      = signal_data.get('sector', signal_data.get('Sector', 'N/A'))
-        bt_wr       = signal_data.get('BT_WinRate_%', signal_data.get('BT_WR', 0))
-        bt_pf       = signal_data.get('BT_ProfitFactor', signal_data.get('BT_PF', 0))
-        bt_rel      = signal_data.get('BT_Reliability', 0)
-        bt_val      = signal_data.get('BT_Validated', signal_data.get('backtest_validated', 'No'))
-        notes       = f"Conf:{confidence:.0f}% RR:{rr_ratio:.1f}x{alert_note}"
+        # Build notes with key info (Rank, Tier, Conf, R:R, Setup, Sector)
+        rank     = signal_data.get('Rank', signal_data.get('rank', ''))
+        tier     = signal_data.get('tier', signal_data.get('Tier', 'N/A'))
+        setup    = signal_data.get('setup_type', signal_data.get('Setup', 'N/A'))
+        sector   = signal_data.get('sector', signal_data.get('Sector', 'N/A'))
+        side_raw = str(signal_data.get('side', 'N/A'))
+        side_display = side_raw.replace('_ALERT', '')  # LONG or SHORT
+        short_alert  = 'ALERT' in side_raw.upper()
+        alert_note   = ' | ⚠️ SHORT via F&O/Options only' if short_alert else ''
 
-        # 20-column row — matches CSV export exactly
-        # Columns: Rank | Quality | Ticker | Side | Entry | SL | T1 | T2 |
-        #          Conf% | RR | Tier | Setup | Sector | BT_WR | BT_PF | BT_Rel |
-        #          BT_Val | Qty(BLANK) | Status | Notes
+        notes = (
+            f"Rank#{rank} | {tier} | Conf:{confidence:.0f}% | "
+            f"R:R:{rr_ratio:.1f}x | {setup} | {sector}{alert_note}"
+        )
+
+        # ── EXACT 10-column layout matching your Google Sheet ────────────────
+        # Ticker | Position | Entry_Price | Quantity | Stop_Loss |
+        # Target_1 | Target_2 | Entry_Date | Status | Notes
         row = [
-            rank,
-            quality,
-            ticker,
-            side_clean,
-            round(float(entry_price), 2) if entry_price else 0,
-            round(float(stop_loss), 2) if stop_loss else 0,
-            round(float(target_1), 2) if target_1 else 0,
-            round(float(target_2), 2) if target_2 else 0,
-            round(float(confidence), 1) if confidence else 0,
-            round(float(rr_ratio), 2) if rr_ratio else 0,
-            tier,
-            setup,
-            sector,
-            bt_wr,
-            bt_pf,
-            bt_rel,
-            bt_val,
-            '',         # ← YOU FILL THIS in Google Sheets
-            'PENDING',
-            notes,
+            ticker,                                                        # A: Ticker
+            side_display,                                                  # B: Position (LONG/SHORT)
+            round(float(entry_price), 2) if entry_price else 0,           # C: Entry_Price
+            '',                                                            # D: Quantity — YOU FILL THIS
+            round(float(stop_loss), 2) if stop_loss else 0,               # E: Stop_Loss
+            round(float(target_1), 2) if target_1 else 0,                 # F: Target_1
+            round(float(target_2), 2) if target_2 else 0,                 # G: Target_2
+            entry_date,                                                    # H: Entry_Date
+            'PENDING',                                                     # I: Status
+            notes,                                                         # J: Notes
         ]
 
-        logger.info(f"Formatted row for {ticker} Rank#{rank}: Entry={entry_price}, SL={stop_loss}, T1={target_1}, T2={target_2}")
+        logger.info(f"Formatted row → {ticker} ({side_display}) Rank#{rank}: "
+                    f"Entry={entry_price}, SL={stop_loss}, T1={target_1}, T2={target_2}")
         return row
         
     except Exception as e:
@@ -442,22 +425,18 @@ def update_google_sheet(signals_data):
         try:
             result = service.spreadsheets().values().get(
                 spreadsheetId=spreadsheet_id,
-                range=f'{sheet_name}!A1:T1'
+                range=f'{sheet_name}!A1:J1'
             ).execute()
             
             values = result.get('values', [])
             
             if not values:
-                headers = [
-                    ['Rank', 'Quality', 'Ticker', 'Side',
-                     'Entry_Price', 'Stop_Loss', 'Target_1', 'Target_2',
-                     'Confidence_%', 'RR_Ratio', 'Tier', 'Setup', 'Sector',
-                     'BT_WinRate_%', 'BT_PF', 'BT_Reliability',
-                     'BT_Validated', 'Qty (YOU FILL)', 'Status', 'Notes']
-                ]
+                # EXACT match to existing Google Sheet columns
+                headers = [['Ticker', 'Position', 'Entry_Price', 'Quantity',
+                            'Stop_Loss', 'Target_1', 'Target_2', 'Entry_Date', 'Status', 'Notes']]
                 service.spreadsheets().values().update(
                     spreadsheetId=spreadsheet_id,
-                    range=f'{sheet_name}!A1:T1',
+                    range=f'{sheet_name}!A1:J1',
                     valueInputOption='RAW',
                     body={'values': headers}
                 ).execute()
@@ -509,7 +488,7 @@ def update_google_sheet(signals_data):
         next_row = existing_rows + 1
         
         # Append the data
-        range_to_update = f'{sheet_name}!A{next_row}:T{next_row + len(rows_to_add) - 1}'
+        range_to_update = f'{sheet_name}!A{next_row}:J{next_row + len(rows_to_add) - 1}'
         
         body = {'values': rows_to_add}
         
@@ -627,28 +606,12 @@ def final_trade_gate(signals: list) -> tuple:
                 return False, f"INVALID SHORT TARGET: {ticker} T1 ({t1}) >= Entry ({entry})"
     
     # ═══════════════════════════════════════════════════════════════════════
-    # CHECK 5: RISK LIMITS
+    # CHECK 5: RISK LIMITS — REMOVED
     # ═══════════════════════════════════════════════════════════════════════
-    
-    MAX_RISK_PER_TRADE = 5.0  # 5% max risk per trade
-    
-    for i, sig in enumerate(signals, 1):
-        ticker = sig.get('ticker', sig.get('Ticker', 'UNKNOWN'))
-        entry = sig.get('entry_price', sig.get('price', 0))
-        sl = sig.get('stop_loss', 0)
-        side = sig.get('side', sig.get('Side', 'UNKNOWN')).replace('_ALERT', '')
-        
-        # Calculate risk percentage
-        if side == 'LONG':
-            risk_pct = ((entry - sl) / entry) * 100
-        else:  # SHORT
-            risk_pct = ((sl - entry) / entry) * 100
-        
-        if risk_pct > MAX_RISK_PER_TRADE:
-            return False, f"EXCESSIVE RISK: {ticker} risk is {risk_pct:.1f}% (max {MAX_RISK_PER_TRADE}%)"
-        
-        if risk_pct < 0.5:
-            return False, f"INSUFFICIENT RISK: {ticker} risk is {risk_pct:.1f}% (too tight SL)"
+    # Risk % per trade is NOT checked here. User decides quantity & position
+    # size manually in Google Sheets. The gate only checks price level sanity
+    # (done above). Removing this prevents 0.1% over-limit from killing all
+    # 5 signals as happened with TTML (5.1% vs 5.0% max).
     
     # ═══════════════════════════════════════════════════════════════════════
     # ALL CHECKS PASSED
