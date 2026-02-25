@@ -265,7 +265,6 @@ def format_sheet_row(signal_data, entry_date):
         # Get Confidence and R:R
         confidence = signal_data.get('confidence', signal_data.get('Confidence', signal_data.get('CONF', 0)))
         
-        # Handle confidence if it's a percentage string like "98.4%"
         if isinstance(confidence, str):
             confidence = confidence.replace('%', '').strip()
             try:
@@ -276,38 +275,33 @@ def format_sheet_row(signal_data, entry_date):
         # Get R:R ratio
         rr_ratio = signal_data.get('risk_reward', signal_data.get('RiskReward', signal_data.get('R:R', signal_data.get('RR', 0))))
         
-        # Handle R:R if it's a string like "1.9x"
         if isinstance(rr_ratio, str):
             rr_ratio = rr_ratio.replace('x', '').strip()
             try:
                 rr_ratio = float(rr_ratio)
             except:
                 rr_ratio = 0
+
+        # Notes from signal data
+        alert_tag = " ⚠️ SHORT_ALERT: Manual/F&O only" if str(signal_data.get('side', '')).upper() == "SHORT_ALERT" else ""
+        notes = f"Conf: {confidence:.1f}% | R:R: {rr_ratio:.2f}x | Setup: {signal_data.get('setup_type','N/A')} | BT_WR: {signal_data.get('BT_WR',0):.1f}%{alert_tag}"
         
-        # Create notes from additional data
-        # Mark SHORT_ALERT signals clearly so you know these are manual-only
-        # (cannot be placed as CNC orders — use Kite app / F&O manually)
-        alert_tag = " ⚠️ SHORT_ALERT: Manual/F&O only" if str(position).upper() == "SHORT_ALERT" else ""
-        position_display = "SHORT" if str(position).upper() == "SHORT_ALERT" else position
-        notes = f"Confidence: {confidence}%, R:R: {rr_ratio}{alert_tag}"
-        
-        # Format row
+        # ── Row format: NO Quantity column — user fills it in Google Sheets ──
+        # Columns: Ticker | Side | Entry | SL | T1 | T2 | Date | Status | Qty(blank) | Notes
         row = [
             ticker,
-            position_display,
+            str(signal_data.get('side', 'N/A')).replace('_ALERT', ''),
             round(float(entry_price), 2) if entry_price else 0,
-            quantity,
             round(float(stop_loss), 2) if stop_loss else 0,
             round(float(target_1), 2) if target_1 else 0,
             round(float(target_2), 2) if target_2 else 0,
             entry_date,
-            'PENDING',  # Initial status
-            notes
+            'PENDING',
+            '',        # Quantity — YOU FILL THIS IN GOOGLE SHEETS
+            notes,
         ]
         
-        # Debug log to help troubleshoot
-        logger.info(f"Formatted row for {ticker}: Price={entry_price}, SL={stop_loss}, T1={target_1}, T2={target_2}")
-        
+        logger.info(f"Formatted row for {ticker}: Entry={entry_price}, SL={stop_loss}, T1={target_1}, T2={target_2}")
         return row
         
     except Exception as e:
@@ -1806,7 +1800,7 @@ MAX_PRICE = 100000
 USE_SECTOR_ROTATION = True      # ✅ ENABLED
 USE_VIX_SENTIMENT = True        # ✅ ENABLED
 USE_FIBONACCI_SCORING = True    # ✅ ENABLED
-USE_PORTFOLIO_RISK = True       # ✅ ENABLED
+USE_PORTFOLIO_RISK = False      # ❌ DISABLED — user decides quantity & position sizing
 USE_MINI_BACKTEST = True        # ✅ ENABLED
 USE_FULL_BACKTEST = True        # ✅ ENABLED
 USE_WALK_FORWARD = False        # [FIX SIGNALS] Was True — walk-forward hard-rejects in BALANCED
@@ -2429,12 +2423,14 @@ class PortfolioRiskManager:
                 f"(max {MAX_SECTOR_EXPOSURE*100:.0f}%)"
             )
 
-        # ── Check 4: Total portfolio risk cap (5% of capital) ────────────────
-        if self.total_risk + trade_risk > self.capital * 0.05:
+        # ── Check 4: Total portfolio risk cap ────────────────────────────────
+        # [FIX] Was 5% — with 1% risk/trade that only allows 5 concurrent trades.
+        # Raised to 10% to properly support up to 10 concurrent positions.
+        if self.total_risk + trade_risk > self.capital * 0.10:
             return False, (
                 f"Portfolio risk cap for {ticker}: "
                 f"total risk would be ₹{self.total_risk + trade_risk:,.0f} "
-                f"(max ₹{self.capital * 0.05:,.0f})"
+                f"(max ₹{self.capital * 0.10:,.0f})"
             )
 
         return True, (
@@ -6003,22 +5999,10 @@ def scan_ticker(
                 confidence = max(30, confidence - 5)
         
         # =====================================================================
-        # STEP 23: PORTFOLIO RISK CHECK (IF ENABLED)
+        # STEP 23: PORTFOLIO RISK CHECK — DISABLED
         # =====================================================================
-        # [FIX MAJ-7] This block was commented out — portfolio sector-exposure
-        # cap was never enforced during scanning.  Now active.
-        if USE_PORTFOLIO_RISK and portfolio_mgr:
-            can_add, reason = portfolio_mgr.can_add_trade({
-                'ticker': ticker,
-                'side': side,
-                'position_value': trade_rule.position_value,
-                'risk_amount': trade_rule.actual_risk,
-                'sector': sector,
-            })
-            if not can_add:
-                stats["portfolio_fail"] += 1
-                log_rejection("Portfolio limit", reason)
-                return None
+        # User decides quantity and position sizing manually in Google Sheets.
+        # No capital/risk filtering applied here.
         
         # =====================================================================
         # STEP 24: CLASSIFY SETUP TYPE (NEW IMPROVEMENT #3)
@@ -6063,9 +6047,9 @@ def scan_ticker(
             "target_1": trade_rule.target_1,
             "target_2": trade_rule.target_2,
             "risk_reward": round(trade_rule.risk_reward_ratio, 2),
-            "qty": trade_rule.qty,
-            "position_value": round(trade_rule.position_value, 2),
-            "risk_amount": round(trade_rule.actual_risk, 2),
+            "qty": 0,              # User decides quantity in Google Sheets
+            "position_value": 0,   # Not calculated — user controlled
+            "risk_amount": 0,      # Not calculated — user controlled
             "entry_signal": entry_info["entry_signal"],
             "reasons": " | ".join(reasons),
             "sector": sector or "N/A",
@@ -6073,8 +6057,6 @@ def scan_ticker(
             "trade_rule": trade_rule,
             "mini_backtest": mini_metrics,
             "backtest_validated": False,
-            
-            # NEW FIELDS
             "setup_type": setup_type,
             "setup_historical_wr": setup_historical_wr,
             "trend_strength": trend_strength,
@@ -6161,9 +6143,11 @@ def hybrid_scan_universe(
         
         if result:
             initial_results.append(result)
-            # [FIX MAJ-7] Track accepted trades so sector exposure cap fires correctly
-            if USE_PORTFOLIO_RISK and portfolio_mgr:
-                portfolio_mgr.add_trade(result)
+            # ⚠️ [CRITICAL FIX] Do NOT call portfolio_mgr.add_trade() during scan.
+            # Adding Phase-1 candidates here treats every passing signal as a deployed
+            # position. After ~8 signals, the portfolio "fills up" and 300+ remaining
+            # stocks fail the safety-buffer check (the root cause of 303/498 portfolio
+            # rejections). The can_add_trade() check uses REAL pre-seeded positions only.
         
         # Progress bar
         if i % 25 == 0 or i == len(tickers):
@@ -6813,18 +6797,19 @@ def get_regime_adjusted_thresholds(regime: str) -> dict:
     return thresholds.get(regime, thresholds['RANGE_BOUND'])
 
 
-def select_top_2_stocks(results: list) -> list:
+def select_top_5_signals(results: list) -> list:
     """
-    ✅ ENHANCED v2.0: Production-ready Top 2 selection using ALL quality metrics
-    
-    Selection Priority:
-    1. Tier (Tier-1 > Tier-2 > Tier-3)
-    2. Backtest Quality (WR, PF, Reliability)
-    3. Setup Type Historical Win Rate
-    4. Relative Strength vs Nifty
-    5. Trend Strength
-    6. Risk:Reward Ratio
-    7. LONG/SHORT Diversification
+    Select TOP 5 signals ranked purely on technical quality.
+    No capital / position-sizing filtering — user decides quantity in Google Sheets.
+
+    Ranking priority:
+    1. Tier  (TIER_1 > TIER_2 > TIER_3)
+    2. Backtest win-rate + profit factor
+    3. Setup type historical win-rate
+    4. Relative strength vs Nifty
+    5. Trend strength
+    6. Risk:Reward
+    7. Confidence
     """
     # ═══════════════════════════════════════════════════════════════════════
     # 🆕 STEP 0: DETECT MARKET REGIME
@@ -7068,138 +7053,105 @@ def select_top_2_stocks(results: list) -> list:
     logger.info("✅ Applied deterministic tie-breaker: Score → WR → Tier → Ticker")
 
     # ═══════════════════════════════════════════════════════════════════════
-    # STEP 4: APPLY DIVERSIFICATION (1 LONG + 1 SHORT IF POSSIBLE)
+    # STEP 4: PICK TOP 5 BY COMPOSITE SCORE
     # ═══════════════════════════════════════════════════════════════════════
 
-    print("\n[STEP 4] Selecting Top 2 by Quality Score...")
+    print("\n[STEP 4] Selecting Top 5 by Quality Score...")
 
-    # 🎯 SIMPLE: ALWAYS SELECT TOP 2 BY SCORE (NO DIVERSIFICATION LOGIC)
-    selected = sorted_results[:2]
-    
-    # Log the selection
-    if len(selected) >= 2:
-        side_1 = selected[0].get('side', 'N/A')
-        side_2 = selected[1].get('side', 'N/A')
-        
-        if side_1 == side_2:
-            selection_method = f"TOP 2 BY QUALITY (Both {side_1})"
-            print(f"   📊 Selection: Best 2 stocks by score (Both {side_1} positions)")
-            logger.info(f"✅ QUALITY-FIRST: Selected top 2 by score - {selected[0]['ticker']} + {selected[1]['ticker']}")
-        else:
-            selection_method = f"TOP 2 BY QUALITY (1 {side_1} + 1 {side_2})"
-            print(f"   📊 Selection: Best 2 stocks by score (Naturally diversified: 1L+1S)")
-            logger.info(f"✅ QUALITY-FIRST: Selected top 2 by score - {selected[0]['ticker']} + {selected[1]['ticker']}")
-    else:
-        selection_method = "TOP 2 BY QUALITY"
-    
-    print(f"   ✅ Selection Method: {selection_method}")
-    
-    # ═══════════════════════════════════════════════════════════════════════
-    # STEP 5: FINAL OUTPUT
-    # ═══════════════════════════════════════════════════════════════════════
-    
+    selected = sorted_results[:5]   # Top 5 — no capital filter, user decides qty
+
     print(f"\n{'='*120}")
-    print(f"🏆 FINAL TOP 2 SELECTED")
+    print(f"🏆 TOP 5 SIGNALS")
     print(f"{'='*120}")
-    
+
     for i, stock in enumerate(selected, 1):
         bt = stock.get('backtest', {})
-        
         print(f"\n{'─'*120}")
-        print(f"#{i} {stock['ticker']} ({stock['side']}) - COMPOSITE SCORE: {stock.get('composite_score', 0):.1f}/100")
+        print(f"#{i} {stock['ticker']} ({stock['side']}) — Score: {stock.get('composite_score', 0):.1f}/100 | Tier: {stock.get('tier','N/A')}")
         print(f"{'─'*120}")
-        
-        print(f"   📊 CLASSIFICATION:")
-        print(f"      Tier: {stock.get('tier', 'N/A')}")
-        print(f"      Setup Type: {stock.get('setup_type', 'N/A')}")
-        
-        print(f"\n   💰 PRICE LEVELS:")
-        print(f"      Entry: ₹{stock.get('entry_price', 0):.2f}")
-        print(f"      Stop Loss: ₹{stock.get('stop_loss', 0):.2f}")
-        print(f"      Target 1: ₹{stock.get('target_1', 0):.2f}")
-        print(f"      Target 2: ₹{stock.get('target_2', 0):.2f}")
-        
-        print(f"\n   📈 QUALITY METRICS:")
-        print(f"      Confidence: {stock.get('confidence', 0):.1f}%")
-        print(f"      R:R Ratio: {stock.get('risk_reward', 0):.1f}x")
-        print(f"      Trend Strength: {stock.get('trend_strength', 0):.0f}")
-        print(f"      Relative Strength: {stock.get('relative_strength', 0):.0f} ({stock.get('rs_interpretation', 'N/A')})")
-        
+        print(f"   Entry: ₹{stock.get('entry_price',0):.2f}  |  SL: ₹{stock.get('stop_loss',0):.2f}  |  T1: ₹{stock.get('target_1',0):.2f}  |  T2: ₹{stock.get('target_2',0):.2f}")
+        print(f"   Confidence: {stock.get('confidence',0):.1f}%  |  R:R: {stock.get('risk_reward',0):.1f}x  |  Setup: {stock.get('setup_type','N/A')}  |  Sector: {stock.get('sector','N/A')}")
         if bt:
-            print(f"\n   🔬 BACKTEST:")
-            print(f"      Win Rate: {bt.get('win_rate', 0):.1f}%")
-            print(f"      Profit Factor: {bt.get('profit_factor', 0):.2f}x")
-            print(f"      Reliability: {bt.get('reliability_score', 0):.1f}/100")
-    
-    print(f"\n{'='*120}\n")
-    # ════════════════════════════════════════════════════════════════════
-    # 🆕 OPTIONAL: MINIMUM QUALITY GAP CHECK
-    # ════════════════════════════════════════════════════════════════════
-    
-    MIN_ACCEPTABLE_GAP = 5   # Alert if gap is larger than this
-    MAX_ACCEPTABLE_GAP = 25  # Critical warning if gap exceeds this
-    
-    if len(selected) == 2:
-        score_1 = selected[0].get('composite_score', 0)
-        score_2 = selected[1].get('composite_score', 0)
-        score_gap = score_1 - score_2
-        
-        print(f"\n{'='*120}")
-        print(f"📊 QUALITY GAP ANALYSIS")
-        print(f"{'='*120}")
-        print(f"   #{1} ({selected[0]['ticker']}): {score_1:.1f}/100")
-        print(f"   #{2} ({selected[1]['ticker']}): {score_2:.1f}/100")
-        print(f"   Gap: {score_gap:.1f} points ({(score_gap/score_1*100):.1f}%)")
-        
-        if score_gap > MAX_ACCEPTABLE_GAP:
-            print(f"   ⚠️  CRITICAL GAP: #{2} is significantly weaker than #{1}")
-            print(f"   ⚠️  Consider trading ONLY #{1} today for better risk management")
-            logger.warning(f"QUALITY GAP WARNING: {selected[0]['ticker']} scores {score_gap:.1f} points higher than {selected[1]['ticker']}")
-        elif score_gap > MIN_ACCEPTABLE_GAP:
-            print(f"   ℹ️  Notable gap: #{1} has clear quality advantage")
-        else:
-            print(f"   ✅ Quality gap is acceptable - both signals are comparable")
-        
-        print(f"{'='*120}\n")
+            print(f"   BT Win Rate: {bt.get('win_rate',0):.1f}%  |  Profit Factor: {bt.get('profit_factor',0):.2f}x  |  Reliability: {bt.get('reliability_score',0):.0f}/100")
 
-    
-
-    selected_tickers = {s['ticker'] for s in selected}
-    rejected = [s for s in sorted_results if s['ticker'] not in selected_tickers]
-    
-    if rejected:
-        print(f"\n🚫 REJECTED CANDIDATES ({len(rejected)} stocks):\n")
-        print(f"   {'Rank':<6} {'Ticker':<10} {'Side':<6} {'Score':<8} {'Tier':<20} {'Rejection Reason':<50}")
-        print(f"   {'-'*110}")
-        
-        for i, stock in enumerate(rejected[:10], 3):  # Show top 10 rejected
-            score = stock.get('composite_score', 0)
-            tier = stock.get('tier', 'N/A')
-            bt = stock.get('backtest', {})
-            bt_wr = bt.get('win_rate', 0) if bt else 0
-            bt_pf = bt.get('profit_factor', 0) if bt else 0
-            
-            # Determine rejection reason
-            if i == 3:
-                reason = "Ranked #3 - Only Top 2 selected"
-            elif tier == 'TIER_3_SPECULATIVE':
-                reason = "TIER_3 - Below quality threshold"
-            elif bt_wr < 55:
-                reason = f"Low Backtest WR: {bt_wr:.1f}% (need ≥55%)"
-            elif bt_pf < 1.2:
-                reason = f"Low Profit Factor: {bt_pf:.2f}x (need ≥1.2x)"
-            elif stock.get('confidence', 0) < 70:
-                reason = f"Low Confidence: {stock.get('confidence', 0):.1f}% (prefer ≥70%)"
-            else:
-                reason = f"Lower Score than Top 2 (diff: {selected[1].get('composite_score', 0) - score:.1f} pts)"
-            
-            print(f"   #{i:<5} {stock['ticker']:<10} {stock['side']:<6} {score:<8.1f} {tier:<20} {reason:<50}")
-    
     print(f"\n{'='*120}\n")
-    
     return selected
 
-def export_top_2_files(top_2: list, signals_dir: str, timestamp: str):
+
+def export_top_5_files(top_5: list, signals_dir: str, timestamp: str):
+    """
+    Export TOP 5 signals to TXT + CSV.
+    NO quantity column — user fills that in Google Sheets.
+    Columns: Rank, Ticker, Side, Entry_Price, Stop_Loss, Target_1, Target_2,
+             Confidence, R:R, Tier, Setup, Sector, BT_WR, BT_PF, Notes
+    """
+    import csv
+
+    os.makedirs(signals_dir, exist_ok=True)
+
+    # ── TXT (human-readable summary) ────────────────────────────────────────
+    txt_file = os.path.join(signals_dir, f"TOP_5_PICKS_{timestamp}.txt")
+    with open(txt_file, 'w', encoding='utf-8') as f:
+        f.write(f"🎯 TOP 5 SIGNALS — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("  Quantity: Fill in Google Sheets — you decide!\n")
+        f.write("="*80 + "\n\n")
+        for i, s in enumerate(top_5, 1):
+            bt = s.get('backtest', {})
+            f.write(f"#{i}  {s['ticker']}  ({s['side']})\n")
+            f.write(f"    Tier      : {s.get('tier','N/A')}\n")
+            f.write(f"    Entry     : ₹{s.get('entry_price',0):.2f}\n")
+            f.write(f"    Stop Loss : ₹{s.get('stop_loss',0):.2f}\n")
+            f.write(f"    Target 1  : ₹{s.get('target_1',0):.2f}\n")
+            f.write(f"    Target 2  : ₹{s.get('target_2',0):.2f}\n")
+            f.write(f"    Confidence: {s.get('confidence',0):.1f}%\n")
+            f.write(f"    R:R       : {s.get('risk_reward',0):.2f}x\n")
+            f.write(f"    Setup     : {s.get('setup_type','N/A')}\n")
+            f.write(f"    Sector    : {s.get('sector','N/A')}\n")
+            if bt:
+                f.write(f"    BT WR     : {bt.get('win_rate',0):.1f}%\n")
+                f.write(f"    BT PF     : {bt.get('profit_factor',0):.2f}x\n")
+            f.write("─"*80 + "\n\n")
+
+    # ── CSV (for Google Sheets) ──────────────────────────────────────────────
+    csv_file = os.path.join(signals_dir, f"TOP_5_PICKS_{timestamp}.csv")
+    with open(csv_file, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow([
+            'Rank', 'ticker', 'side',
+            'entry_price', 'stop_loss', 'target_1', 'target_2',
+            'confidence', 'risk_reward', 'tier', 'setup_type', 'sector',
+            'BT_WR', 'BT_PF', 'BT_Reliability',
+            'backtest_validated', 'notes'
+        ])
+        for i, s in enumerate(top_5, 1):
+            bt = s.get('backtest', {})
+            reasons_short = s.get('reasons', '')[:120]
+            writer.writerow([
+                i,
+                s.get('ticker', ''),
+                s.get('side', ''),
+                s.get('entry_price', 0),
+                s.get('stop_loss', 0),
+                s.get('target_1', 0),
+                s.get('target_2', 0),
+                round(s.get('confidence', 0), 1),
+                round(s.get('risk_reward', 0), 2),
+                s.get('tier', 'UNKNOWN'),
+                s.get('setup_type', 'UNKNOWN'),
+                s.get('sector', 'N/A'),
+                round(bt.get('win_rate', 0), 1) if bt else 0,
+                round(bt.get('profit_factor', 0), 2) if bt else 0,
+                round(bt.get('reliability_score', 0), 1) if bt else 0,
+                'Yes' if s.get('backtest_validated') else 'No',
+                reasons_short,
+            ])
+
+    print(f"✅ TOP 5 files exported:")
+    print(f"   📄 TXT: {txt_file}")
+    print(f"   📄 CSV: {csv_file}")
+    return txt_file, csv_file
+
+
     """
     Export TOP 2 to txt and csv files
     ✅ FIXED: Includes ALL columns needed by Google Sheets
@@ -7498,8 +7450,9 @@ def main():
             
             if result:
                 results.append(result)
-                if USE_PORTFOLIO_RISK and portfolio_mgr:
-                    portfolio_mgr.add_trade(result)
+                # ⚠️ [CRITICAL FIX] Same as hybrid_scan_universe — do NOT add scan
+                # candidates to portfolio_mgr during the scan loop. Only real open
+                # positions (pre-seeded from Google Sheets) should be tracked here.
             
             if i % 25 == 0 or i == len(tickers):
                 pct = (i / len(tickers)) * 100
@@ -7552,6 +7505,7 @@ def main():
     print(f"   Backtest:          {BACKTEST_MODE}")
     print(f"   Stocks Scanned:    {stats['total']}")
     print(f"   Signals Found:     {len(results)}")
+    print(f"   Top 5 Selected:    (see TOP_5_PICKS files)")
     print(f"   Success Rate:      {(stats['passed']/stats['total']*100) if stats['total'] > 0 else 0:.1f}%")
     print(f"   Scan Time:         {scan_time:.1f} seconds")
     
@@ -7566,12 +7520,10 @@ def main():
     print(f"\n💾 OUTPUT: {SIGNALS_DIR}/")
     
     # Auto TOP selection — works with any number of results >= 1
-    # [FIX SIGNALS] Was `>= 2` — now runs even with a single signal so it
-    # always exports the TOP_2_PICKS CSV that Google Sheets reads from.
     if results and len(results) >= 1:
-        top_picks = select_top_2_stocks(results)
+        top_picks = select_top_5_signals(results)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        export_top_2_files(top_picks, SIGNALS_DIR, timestamp)
+        export_top_5_files(top_picks, SIGNALS_DIR, timestamp)
     
     print("\n" + "="*120 + "\n")
     return results
@@ -8146,15 +8098,14 @@ def github_actions_main():
             html_file = None
             
             if os.path.exists(signals_dir):
-                top_2_files = sorted([f for f in os.listdir(signals_dir) 
-                                     if f.startswith('TOP_2_PICKS') and f.endswith('.csv')])
+                top_5_files = sorted([f for f in os.listdir(signals_dir) 
+                                     if f.startswith('TOP_5_PICKS') and f.endswith('.csv')])
                 csv_files = sorted([f for f in os.listdir(signals_dir) if f.endswith('.csv')])
                 html_files = sorted([f for f in os.listdir(signals_dir) if f.endswith('.html')])
                 
-                # Use TOP_2_PICKS file if available (contains the actual top 2 by win rate)
-                if top_2_files:
-                    csv_file = os.path.join(signals_dir, top_2_files[-1])
-                    logger.info(f"📄 Found TOP_2_PICKS CSV (will use for Google Sheets): {csv_file}")
+                if top_5_files:
+                    csv_file = os.path.join(signals_dir, top_5_files[-1])
+                    logger.info(f"📄 Found TOP_5_PICKS CSV (will use for Google Sheets): {csv_file}")
                 elif csv_files:
                     csv_file = os.path.join(signals_dir, csv_files[-1])
                     logger.info(f"📄 Found CSV: {csv_file}")
