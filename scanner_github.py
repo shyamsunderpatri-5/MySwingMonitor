@@ -283,25 +283,47 @@ def format_sheet_row(signal_data, entry_date):
                 rr_ratio = 0
 
         # Notes from signal data
-        alert_tag = " ⚠️ SHORT_ALERT: Manual/F&O only" if str(signal_data.get('side', '')).upper() == "SHORT_ALERT" else ""
-        notes = f"Conf: {confidence:.1f}% | R:R: {rr_ratio:.2f}x | Setup: {signal_data.get('setup_type','N/A')} | BT_WR: {signal_data.get('BT_WR',0):.1f}%{alert_tag}"
-        
-        # ── Row format: NO Quantity column — user fills it in Google Sheets ──
-        # Columns: Ticker | Side | Entry | SL | T1 | T2 | Date | Status | Qty(blank) | Notes
+        alert_note = ' (Manual/F&O only - cannot CNC)' if str(signal_data.get('side', '')).upper() == "SHORT_ALERT" else ""
+        side_clean  = str(signal_data.get('side', 'N/A')).replace('_ALERT', '')
+        rank        = signal_data.get('Rank', signal_data.get('rank', ''))
+        quality     = signal_data.get('Quality', signal_data.get('quality', ''))
+        tier        = signal_data.get('tier', signal_data.get('Tier', 'N/A'))
+        setup       = signal_data.get('setup_type', signal_data.get('Setup', 'N/A'))
+        sector      = signal_data.get('sector', signal_data.get('Sector', 'N/A'))
+        bt_wr       = signal_data.get('BT_WinRate_%', signal_data.get('BT_WR', 0))
+        bt_pf       = signal_data.get('BT_ProfitFactor', signal_data.get('BT_PF', 0))
+        bt_rel      = signal_data.get('BT_Reliability', 0)
+        bt_val      = signal_data.get('BT_Validated', signal_data.get('backtest_validated', 'No'))
+        notes       = f"Conf:{confidence:.0f}% RR:{rr_ratio:.1f}x{alert_note}"
+
+        # 20-column row — matches CSV export exactly
+        # Columns: Rank | Quality | Ticker | Side | Entry | SL | T1 | T2 |
+        #          Conf% | RR | Tier | Setup | Sector | BT_WR | BT_PF | BT_Rel |
+        #          BT_Val | Qty(BLANK) | Status | Notes
         row = [
+            rank,
+            quality,
             ticker,
-            str(signal_data.get('side', 'N/A')).replace('_ALERT', ''),
+            side_clean,
             round(float(entry_price), 2) if entry_price else 0,
             round(float(stop_loss), 2) if stop_loss else 0,
             round(float(target_1), 2) if target_1 else 0,
             round(float(target_2), 2) if target_2 else 0,
-            entry_date,
+            round(float(confidence), 1) if confidence else 0,
+            round(float(rr_ratio), 2) if rr_ratio else 0,
+            tier,
+            setup,
+            sector,
+            bt_wr,
+            bt_pf,
+            bt_rel,
+            bt_val,
+            '',         # ← YOU FILL THIS in Google Sheets
             'PENDING',
-            '',        # Quantity — YOU FILL THIS IN GOOGLE SHEETS
             notes,
         ]
-        
-        logger.info(f"Formatted row for {ticker}: Entry={entry_price}, SL={stop_loss}, T1={target_1}, T2={target_2}")
+
+        logger.info(f"Formatted row for {ticker} Rank#{rank}: Entry={entry_price}, SL={stop_loss}, T1={target_1}, T2={target_2}")
         return row
         
     except Exception as e:
@@ -420,24 +442,25 @@ def update_google_sheet(signals_data):
         try:
             result = service.spreadsheets().values().get(
                 spreadsheetId=spreadsheet_id,
-                range=f'{sheet_name}!A1:J1'
+                range=f'{sheet_name}!A1:T1'
             ).execute()
             
             values = result.get('values', [])
             
             if not values:
                 headers = [
-                    ['Ticker', 'Position', 'Entry_Price', 'Quantity', 'Stop_Loss', 
-                     'Target_1', 'Target_2', 'Entry_Date', 'Status', 'Notes']
+                    ['Rank', 'Quality', 'Ticker', 'Side',
+                     'Entry_Price', 'Stop_Loss', 'Target_1', 'Target_2',
+                     'Confidence_%', 'RR_Ratio', 'Tier', 'Setup', 'Sector',
+                     'BT_WinRate_%', 'BT_PF', 'BT_Reliability',
+                     'BT_Validated', 'Qty (YOU FILL)', 'Status', 'Notes']
                 ]
-                
                 service.spreadsheets().values().update(
                     spreadsheetId=spreadsheet_id,
-                    range=f'{sheet_name}!A1:J1',
+                    range=f'{sheet_name}!A1:T1',
                     valueInputOption='RAW',
                     body={'values': headers}
                 ).execute()
-                
                 logger.info("✅ Added column headers to Google Sheet")
                 
         except HttpError as e:
@@ -470,11 +493,7 @@ def update_google_sheet(signals_data):
             logger.warning("⚠️  No rows formatted successfully")
             return True
         
-        # 🚨 ENFORCEMENT POINT #2: Verify formatting didn't lose signals
-        if len(rows_to_add) != 2:
-            logger.critical(f"❌ FORMATTING ERROR: Started with 2 signals, formatted {len(rows_to_add)}")
-            logger.critical(f"❌ REFUSING to upload incomplete data")
-            return False
+        logger.info(f"✅ Formatted {len(rows_to_add)} signal rows for upload")
         
         # ════════════════════════════════════════════════════════════════════
         # WRITE TO GOOGLE SHEET
@@ -490,7 +509,7 @@ def update_google_sheet(signals_data):
         next_row = existing_rows + 1
         
         # Append the data
-        range_to_update = f'{sheet_name}!A{next_row}:J{next_row + len(rows_to_add) - 1}'
+        range_to_update = f'{sheet_name}!A{next_row}:T{next_row + len(rows_to_add) - 1}'
         
         body = {'values': rows_to_add}
         
@@ -1218,39 +1237,99 @@ class KiteDataProvider:
 
     @staticmethod
     def _infer_sector_from_name(name: str, symbol: str) -> Optional[str]:
-        """Rough sector inference from company name / symbol."""
+        """Rough sector inference from company name / symbol — enhanced with symbol map."""
         n = name.upper()
         s = symbol.upper()
 
-        # Banking
-        if any(k in n for k in ['BANK', 'BANKING', 'NBF', 'NBFC']):
-            return 'Financial Services'
-        # IT
-        if any(k in n for k in ['TECH', 'INFOSY', 'WIPRO', 'INFRA', 'SOFTWARE', 'DIGIT', 'IT LTD', 'SYSTEMS']):
-            return 'Information Technology'
-        # Pharma
-        if any(k in n for k in ['PHARMA', 'DRUG', 'MEDICINE', 'HEALTH', 'BIOCON', 'CIPLA', 'LUPIN']):
-            return 'Healthcare'
-        # Auto
-        if any(k in n for k in ['AUTO', 'MOTOR', 'AUTOMOBILE', 'TRACTOR', 'VEHICLES', 'BAJAJ']):
-            return 'Automobile'
-        # FMCG
-        if any(k in n for k in ['FOODS', 'BEVERAGES', 'CONSUMER', 'HINDUSTAN UNILEVER', 'ITC', 'MARICO', 'BRITANNIA']):
-            return 'Consumer Goods'
-        # Metal
-        if any(k in n for k in ['STEEL', 'METAL', 'ALUMIN', 'COPPER', 'ZINC', 'IRON']):
-            return 'Metals'
-        # Energy
-        if any(k in n for k in ['OIL', 'GAS', 'PETRO', 'POWER', 'ENERGY', 'COAL']):
-            return 'Energy'
-        # Real Estate
-        if any(k in n for k in ['REALTY', 'REAL ESTATE', 'HOUSING', 'PROPERTY', 'BUILDER', 'DLF']):
-            return 'Real Estate'
-        # Finance (non-banking)
-        if any(k in n for k in ['FINANCE', 'FINANCIAL', 'CAPITAL', 'INVEST', 'AMC', 'INSURANCE']):
-            return 'Financial Services'
+        # ── Symbol-based direct lookup (most reliable) ────────────────────────
+        SYMBOL_SECTOR = {
+            # Banking
+            'HDFCBANK':'Financial Services','ICICIBANK':'Financial Services',
+            'SBIN':'Financial Services','AXISBANK':'Financial Services',
+            'KOTAKBANK':'Financial Services','INDUSINDBK':'Financial Services',
+            'BANDHANBNK':'Financial Services','FEDERALBNK':'Financial Services',
+            'IDFCFIRSTB':'Financial Services','PNB':'Financial Services',
+            'CANBK':'Financial Services','BANKBARODA':'Financial Services',
+            'AUBANK':'Financial Services','RBLBANK':'Financial Services',
+            # IT
+            'TCS':'Information Technology','INFY':'Information Technology',
+            'WIPRO':'Information Technology','HCLTECH':'Information Technology',
+            'TECHM':'Information Technology','LTIM':'Information Technology',
+            'MPHASIS':'Information Technology','COFORGE':'Information Technology',
+            'PERSISTENT':'Information Technology','KPITTECH':'Information Technology',
+            # Pharma
+            'SUNPHARMA':'Healthcare','DRREDDY':'Healthcare','CIPLA':'Healthcare',
+            'LUPIN':'Healthcare','AUROPHARMA':'Healthcare','BIOCON':'Healthcare',
+            'DIVISLAB':'Healthcare','TORNTPHARM':'Healthcare','ALKEM':'Healthcare',
+            'ABBOTINDIA':'Healthcare','PFIZER':'Healthcare','GLAXO':'Healthcare',
+            # Auto
+            'MARUTI':'Automobile','M&M':'Automobile','BAJAJ-AUTO':'Automobile',
+            'HEROMOTOCO':'Automobile','TATAMOTORS':'Automobile','EICHERMOT':'Automobile',
+            'ASHOKLEY':'Automobile','TVSMOTOR':'Automobile','BOSCHLTD':'Automobile',
+            'JBMA':'Automobile','MOTHERSON':'Automobile','BALKRISIND':'Automobile',
+            # FMCG
+            'HINDUNILVR':'Consumer Goods','ITC':'Consumer Goods','NESTLEIND':'Consumer Goods',
+            'BRITANNIA':'Consumer Goods','DABUR':'Consumer Goods','MARICO':'Consumer Goods',
+            'GODREJCP':'Consumer Goods','EMAMILTD':'Consumer Goods','COLPAL':'Consumer Goods',
+            # Metal
+            'TATASTEEL':'Metals','JSWSTEEL':'Metals','HINDALCO':'Metals',
+            'VEDL':'Metals','SAIL':'Metals','NMDC':'Metals','NATIONALUM':'Metals',
+            'JINDALSTEL':'Metals','APLAPOLLO':'Metals','RATNAMANI':'Metals',
+            # Energy/Oil
+            'RELIANCE':'Energy','ONGC':'Energy','BPCL':'Energy','IOC':'Energy',
+            'HINDPETRO':'Energy','GAIL':'Energy','PETRONET':'Energy',
+            'POWERGRID':'Energy','NTPC':'Energy','ADANIPOWER':'Energy',
+            'TORNTPOWER':'Energy','TATAPOWER':'Energy','CESC':'Energy',
+            # Real Estate
+            'DLF':'Real Estate','GODREJPROP':'Real Estate','OBEROIRLTY':'Real Estate',
+            'PRESTIGE':'Real Estate','BRIGADE':'Real Estate','SOBHA':'Real Estate',
+            'LODHA':'Real Estate','PHOENIXLTD':'Real Estate',
+            'HUDCO':'Real Estate','HOMEFIRST':'Real Estate',
+            # Finance (non-banking)
+            'BAJFINANCE':'Financial Services','BAJAJFINSV':'Financial Services',
+            'CHOLAFIN':'Financial Services','M&MFIN':'Financial Services',
+            'LICHSGFIN':'Financial Services','PNBHOUSING':'Financial Services',
+            'MUTHOOTFIN':'Financial Services','MANAPPURAM':'Financial Services',
+            'SBICARD':'Financial Services','HDFC':'Financial Services',
+            'POLICYBZR':'Financial Services','HDFCLIFE':'Financial Services',
+            'SBILIFE':'Financial Services','ICICIGI':'Financial Services',
+            'LICI':'Financial Services','ABSLAMC':'Financial Services',
+            # Infra/Construction
+            'LT':'Infrastructure','ULTRACEMCO':'Infrastructure','ACC':'Infrastructure',
+            'AMBUJACEM':'Infrastructure','RAMCOCEM':'Infrastructure','DALMIACEM':'Infrastructure',
+            'JKCEMENT':'Infrastructure','SHREECEM':'Infrastructure',
+            'ADANIPORTS':'Infrastructure','GMRINFRA':'Infrastructure',
+            # FMCG/Consumer
+            'MCDOWELL-N':'Consumer Goods','UBL':'Consumer Goods','VARUNBEV':'Consumer Goods',
+            # Media
+            'ZEEL':'Media','SUNTV':'Media','PVRINOX':'Media',
+        }
+        if s in SYMBOL_SECTOR:
+            return SYMBOL_SECTOR[s]
 
-        return None
+        # ── Keyword fallback ──────────────────────────────────────────────────
+        if any(k in n for k in ['BANK', 'BANKING', 'NBFC']):
+            return 'Financial Services'
+        if any(k in n for k in ['TECH', 'INFOSY', 'SOFTWARE', 'DIGIT', 'SYSTEMS', 'COMPUTER']):
+            return 'Information Technology'
+        if any(k in n for k in ['PHARMA', 'DRUG', 'MEDICINE', 'HEALTH', 'BIO', 'THERAPEUT']):
+            return 'Healthcare'
+        if any(k in n for k in ['AUTO', 'MOTOR', 'AUTOMOBILE', 'TRACTOR', 'VEHICLE']):
+            return 'Automobile'
+        if any(k in n for k in ['FOODS', 'BEVERAGES', 'CONSUMER', 'FMCG', 'MARICO', 'BRITANNIA']):
+            return 'Consumer Goods'
+        if any(k in n for k in ['STEEL', 'METAL', 'ALUMIN', 'COPPER', 'ZINC', 'IRON', 'ALLOY']):
+            return 'Metals'
+        if any(k in n for k in ['OIL', 'GAS', 'PETRO', 'POWER', 'ENERGY', 'COAL', 'REFIN']):
+            return 'Energy'
+        if any(k in n for k in ['REALTY', 'REAL ESTATE', 'HOUSING', 'PROPERTY', 'BUILDER', 'INFRA', 'CEMENT']):
+            return 'Infrastructure'
+        if any(k in n for k in ['FINANCE', 'FINANCIAL', 'CAPITAL', 'INVEST', 'AMC', 'INSURANCE', 'NBFC']):
+            return 'Financial Services'
+        if any(k in n for k in ['MEDIA', 'ENTERTAINMENT', 'TELECOM', 'BROADCAST']):
+            return 'Media'
+
+        return 'Others'
 
     # ------------------------------------------------------------------ #
     # BULK CACHE BUILD (replaces build_cache in scanner)                  #
@@ -6670,16 +6749,19 @@ def classify_signal_tier(result: Dict, backtest_result: Optional[BacktestResult]
         bt_win_rate = bt.get('win_rate', 0)
         bt_pf = bt.get('profit_factor', 0)
 
-    # Tier 1 Requirements (PREMIUM)
+    # Tier 1 Requirements (PREMIUM) — needs 3 of 5 checks
+    # Note: bt_win_rate/bt_pf are 0 when full backtest hasn't run (Phase 1 only).
+    # Don't penalise signals just because backtest wasn't run yet.
+    has_backtest = bt_win_rate > 0 or bt_pf > 0
     tier1_checks = [
-        confidence >= 75,
-        rr >= 2.0,
-        mini_bt.get('success_reason', '') in ['Target hit, stop not hit', 'Target hit before stop'],
-        bt_win_rate >= 58,
-        bt_pf >= 1.7,
+        confidence >= 80,                                                           # High confidence
+        rr >= 2.0,                                                                  # Good R:R
+        mini_bt.get('success_reason', '') in ['Target hit, stop not hit', 'Target hit before stop'],  # Mini BT pass
+        bt_win_rate >= 58 if has_backtest else True,                               # BT win rate (or skip if not run)
+        bt_pf >= 1.7 if has_backtest else True,                                    # BT profit factor (or skip)
     ]
     
-    if sum(1 for x in tier1_checks if x) >= 4:
+    if sum(1 for x in tier1_checks if x) >= 3:
         return "TIER_1_PREMIUM"
     
     # Tier 2 Requirements (STANDARD)
@@ -7061,20 +7143,33 @@ def select_top_5_signals(results: list) -> list:
     selected = sorted_results[:5]   # Top 5 — no capital filter, user decides qty
 
     print(f"\n{'='*120}")
-    print(f"🏆 TOP 5 SIGNALS")
+    print(f"🏆 TOP 5 SIGNALS  ──  Ranked BEST → WORST  |  Pick from top down based on your available capital")
+    print(f"   #1 = Highest quality  |  #5 = Lowest quality (still passes all filters)")
+    print(f"   SHORT_ALERT = Cannot place CNC order — trade via Options/F&O on Kite manually")
     print(f"{'='*120}")
+
+    RANK_LABELS = {1: '⭐⭐⭐ BEST', 2: '⭐⭐ GOOD', 3: '⭐ DECENT', 4: 'OK', 5: 'OK'}
 
     for i, stock in enumerate(selected, 1):
         bt = stock.get('backtest', {})
-        print(f"\n{'─'*120}")
-        print(f"#{i} {stock['ticker']} ({stock['side']}) — Score: {stock.get('composite_score', 0):.1f}/100 | Tier: {stock.get('tier','N/A')}")
-        print(f"{'─'*120}")
-        print(f"   Entry: ₹{stock.get('entry_price',0):.2f}  |  SL: ₹{stock.get('stop_loss',0):.2f}  |  T1: ₹{stock.get('target_1',0):.2f}  |  T2: ₹{stock.get('target_2',0):.2f}")
-        print(f"   Confidence: {stock.get('confidence',0):.1f}%  |  R:R: {stock.get('risk_reward',0):.1f}x  |  Setup: {stock.get('setup_type','N/A')}  |  Sector: {stock.get('sector','N/A')}")
-        if bt:
-            print(f"   BT Win Rate: {bt.get('win_rate',0):.1f}%  |  Profit Factor: {bt.get('profit_factor',0):.2f}x  |  Reliability: {bt.get('reliability_score',0):.0f}/100")
+        side = stock['side']
+        side_display = '📉 SHORT (Manual/F&O)' if 'ALERT' in str(side) else ('📈 LONG' if side == 'LONG' else '📉 SHORT')
+        label = RANK_LABELS.get(i, '')
+        tier = stock.get('tier', 'N/A')
+        tier_emoji = '🥇' if 'TIER_1' in str(tier) else ('🥈' if 'TIER_2' in str(tier) else '🥉')
 
-    print(f"\n{'='*120}\n")
+        print(f"\n{'─'*120}")
+        print(f"  RANK #{i}  {label}  |  {stock['ticker']}  |  {side_display}  |  {tier_emoji} {tier}  |  Score: {stock.get('composite_score',0):.1f}/100")
+        print(f"{'─'*120}")
+        print(f"   📌 Entry : ₹{stock.get('entry_price',0):.2f}     Stop Loss: ₹{stock.get('stop_loss',0):.2f}     Target 1: ₹{stock.get('target_1',0):.2f}     Target 2: ₹{stock.get('target_2',0):.2f}")
+        print(f"   📊 Conf  : {stock.get('confidence',0):.1f}%     R:R Ratio: {stock.get('risk_reward',0):.2f}x     Setup: {stock.get('setup_type','N/A')}     Sector: {stock.get('sector','N/A')}")
+        if bt:
+            print(f"   🔬 BT WR : {bt.get('win_rate',0):.1f}%     Profit Factor: {bt.get('profit_factor',0):.2f}x     Reliability: {bt.get('reliability_score',0):.0f}/100")
+
+    print(f"\n{'='*120}")
+    print(f"  💡 TIP: Start with #1. If the stock price is too high for your capital, move to #2, then #3, etc.")
+    print(f"  💡 Qty column in Google Sheets is BLANK — fill it yourself based on your capital & risk appetite.")
+    print(f"{'='*120}\n")
     return selected
 
 
@@ -7114,22 +7209,26 @@ def export_top_5_files(top_5: list, signals_dir: str, timestamp: str):
 
     # ── CSV (for Google Sheets) ──────────────────────────────────────────────
     csv_file = os.path.join(signals_dir, f"TOP_5_PICKS_{timestamp}.csv")
+    RANK_LABELS = {1: 'BEST', 2: 'GOOD', 3: 'DECENT', 4: 'OK', 5: 'OK'}
     with open(csv_file, 'w', newline='', encoding='utf-8') as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow([
-            'Rank', 'ticker', 'side',
+            'Rank', 'Quality', 'Ticker', 'Side',
             'entry_price', 'stop_loss', 'target_1', 'target_2',
-            'confidence', 'risk_reward', 'tier', 'setup_type', 'sector',
-            'BT_WR', 'BT_PF', 'BT_Reliability',
-            'backtest_validated', 'notes'
+            'Confidence_%', 'RR_Ratio', 'Tier', 'Setup', 'Sector',
+            'BT_WinRate_%', 'BT_ProfitFactor', 'BT_Reliability',
+            'BT_Validated', 'Qty(YOU_FILL)', 'Status', 'Notes'
         ])
         for i, s in enumerate(top_5, 1):
             bt = s.get('backtest', {})
-            reasons_short = s.get('reasons', '')[:120]
+            reasons_short = s.get('reasons', '')[:100]
+            side_clean = str(s.get('side', '')).replace('_ALERT', '')
+            alert_note = ' (Manual/F&O only - cannot CNC)' if 'ALERT' in str(s.get('side', '')) else ''
             writer.writerow([
                 i,
+                RANK_LABELS.get(i, 'OK'),
                 s.get('ticker', ''),
-                s.get('side', ''),
+                side_clean,
                 s.get('entry_price', 0),
                 s.get('stop_loss', 0),
                 s.get('target_1', 0),
@@ -7143,7 +7242,9 @@ def export_top_5_files(top_5: list, signals_dir: str, timestamp: str):
                 round(bt.get('profit_factor', 0), 2) if bt else 0,
                 round(bt.get('reliability_score', 0), 1) if bt else 0,
                 'Yes' if s.get('backtest_validated') else 'No',
-                reasons_short,
+                '',        # Qty — YOU FILL THIS
+                'PENDING',
+                f"Conf:{s.get('confidence',0):.0f}% RR:{s.get('risk_reward',0):.1f}x{alert_note} | {reasons_short}",
             ])
 
     print(f"✅ TOP 5 files exported:")
