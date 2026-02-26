@@ -5889,23 +5889,17 @@ def scan_ticker(
         # STEP 17: DETERMINE BEST SIDE
         # =====================================================================
         long_valid = long_entry["entry_ready"] and long_conf >= MIN_CONFIDENCE
-        short_valid = short_entry["entry_ready"] and short_conf >= MIN_CONFIDENCE
-        
-        if not (long_valid or short_valid):
+
+        # LONG-ONLY MODE: skip anything that isn't a valid LONG setup
+        if not long_valid:
             stats["confidence_fail"] += 1
-            log_rejection("Low confidence", f"L:{long_conf:.0f}% S:{short_conf:.0f}%")
+            log_rejection("No LONG setup", f"L:{long_conf:.0f}%")
             return None
-        
-        if long_valid and (not short_valid or long_conf >= short_conf):
-            side = "LONG"
-            confidence = long_conf
-            reasons = long_reasons
-            entry_info = long_entry
-        else:
-            side = "SHORT"
-            confidence = short_conf
-            reasons = short_reasons
-            entry_info = short_entry
+
+        side = "LONG"
+        confidence = long_conf
+        reasons = long_reasons
+        entry_info = long_entry
         
         # =====================================================================
         # STEP 18: BREAKOUT CONFIRMATION CHECK (NEW IMPROVEMENT #2)
@@ -6034,14 +6028,7 @@ def scan_ticker(
                 confidence = max(30, confidence - 5)
                 logger.debug(f"{ticker}: Weak RS penalty applied (RS: {rs_value:.0f})")
         
-        # Reject strong stocks for SHORT signals only if VERY_STRONG
-        if side == "SHORT":
-            if rs_interpretation == "VERY_STRONG":
-                stats["confidence_fail"] += 1
-                log_rejection("Very Strong RS", f"RS: {rs_value:.0f} — too strong for SHORT")
-                return None
-            elif rs_interpretation == "STRONG":
-                confidence = max(30, confidence - 5)
+
         
         # =====================================================================
         # STEP 23: PORTFOLIO RISK CHECK — DISABLED
