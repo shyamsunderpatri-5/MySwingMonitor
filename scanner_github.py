@@ -5252,7 +5252,7 @@ def build_cache(tickers: List[str]) -> Optional[pd.DataFrame]:
             
             # Build clean dataframe with actual ticker used
             clean_df = pd.DataFrame({
-                'Date': df.index,
+                'Date': df['Date'] if 'Date' in df.columns else df.index,
                 'Open': df['Open'].values,
                 'High': df['High'].values,
                 'Low': df['Low'].values,
