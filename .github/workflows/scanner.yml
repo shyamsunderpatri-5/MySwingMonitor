@@ -37,9 +37,6 @@ jobs:
         run: |
           pip install -r requirements.txt
           pip install ta scipy
-               
-      - name: Refresh Kite Token (before scan)
-        run: python auto_token_refresh.py
 
       - name: Run NSE Scanner
         run: python scanner_github.py
