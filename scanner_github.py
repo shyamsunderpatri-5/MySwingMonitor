@@ -7674,6 +7674,35 @@ Running on GitHub Actions ⚡
 # ============================================================================
 # MODIFIED MAIN FUNCTION FOR GITHUB ACTIONS
 # ============================================================================
+def _read_kite_token_from_sheet() -> str:
+    """Read Kite access token from KiteConfig!B3 in Google Sheet"""
+    try:
+        import json
+        from google.oauth2.service_account import Credentials
+        from googleapiclient.discovery import build
+
+        creds = Credentials.from_service_account_info(
+            json.loads(GOOGLE_SHEETS_CONFIG["credentials_json"]),
+            scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
+        )
+        svc = build("sheets", "v4", credentials=creds)
+
+        result = svc.spreadsheets().values().get(
+            spreadsheetId=GOOGLE_SHEETS_CONFIG["spreadsheet_id"],
+            range="KiteConfig!B2:B4",
+            valueRenderOption="UNFORMATTED_VALUE"
+        ).execute()
+
+        values = result.get("values", [])
+        access_token = values[1][0]
+        token_time   = values[2][0] if len(values) > 2 else "Unknown"
+
+        logger.info(f"✅ Kite token read from Google Sheet (updated: {token_time})")
+        return str(access_token).strip()
+
+    except Exception as e:
+        logger.error(f"❌ Failed to read Kite token from KiteConfig sheet: {e}")
+        return None
 
 def _check_daily_loss_circuit_breaker() -> tuple:
     """
@@ -8087,14 +8116,25 @@ def github_actions_main():
 
         logger.info(f"⚡ Circuit breaker: {cb_reason}")
 
-        # ── [FIX RETRY-1] Kite connection with exponential-backoff retry ──────
-        if not kite_provider.is_connected:
-            connected = _kite_connect_with_retry(max_attempts=3, base_delay=5.0)
-            if not connected:
-                logger.critical("❌ Kite NOT connected after all retry attempts — scan aborted")
-                raise RuntimeError("Kite not connected after 3 retry attempts")
-        else:
-            logger.info("✅ Kite already connected — skipping retry logic")
+        # ── Read Kite token from Google Sheet (KiteConfig tab) ───────────────
+        logger.info("📖 Reading Kite token from KiteConfig sheet...")
+        access_token = _read_kite_token_from_sheet()
+
+        if not access_token:
+            raise RuntimeError(
+                "Could not read Kite token from KiteConfig sheet. "
+                "Check that your Google Apps Script has updated KiteConfig!B3 today."
+            )
+
+        from kiteconnect import KiteConnect
+        from config_kite import KITE_API_KEY
+        kite_provider._kite = KiteConnect(api_key=KITE_API_KEY)
+        kite_provider._kite.set_access_token(access_token)
+        kite_provider._instruments_loaded = False
+
+        logger.info("✅ Kite token injected from Google Sheet — loading instruments...")
+        kite_provider._load_instruments()
+        logger.info(f"✅ Kite ready: {len(kite_provider._instrument_cache)} instruments loaded")
 
         # ── [FIX RISK-1] Seed PortfolioRiskManager with real open positions ──
         # portfolio_mgr is created inside main() — we pre-seed it here via a
