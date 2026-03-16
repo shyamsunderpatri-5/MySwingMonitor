@@ -1634,7 +1634,7 @@ kite_provider = KiteDataProvider()
 # CONFIGURATION - CHANGE THESE SETTINGS
 # ============================================================================
 
-ACCURACY_MODE = 'BALANCED'  # 'CONSERVATIVE', 'BALANCED', or 'AGGRESSIVE'
+ACCURACY_MODE = 'AGGRESSIVE'   # [FIX SIGNALS v8.6] Switched from BALANCED — market too choppy for BALANCED
 BACKTEST_MODE = 'HYBRID'      # 'MINI', 'FULL', 'HYBRID', 'NONE'
 
 # ── FIX: CNC SHORT TRADING NOT SUPPORTED ON NSE EQUITY ──────────────────────
@@ -1678,7 +1678,7 @@ PRESETS = {
         # ✅ OPTIMIZED FOR 3-8 DAILY SIGNALS (was 2-5, too strict)
         'min_confidence': 60,               # [FIX SIGNALS] Was 65 — lowered to 60
         'min_turnover': 600_000,            # [FIX SIGNALS] Was 800k — lowered to 600k
-        'min_rr_ratio': 1.5,                # [FIX SIGNALS] Was 1.7 — lowered to 1.5
+        'min_rr_ratio': 1.3,                # [FIX SIGNALS v8.6] Lowered for choppy market conditions
         'min_volatility_pct': 0.004,        # [FIX SIGNALS] Was 0.005 — lowered slightly
         'min_volume_ratio': 0.4,            # [FIX SIGNALS] Was 0.5 — lowered slightly
         'rsi_range_long': (35, 65),         # [FIX SIGNALS] Was (40,62) — wider range
@@ -6020,9 +6020,10 @@ def scan_ticker(
         # Only VERY_WEAK for LONGs is a hard stop (stock is clearly underperforming badly).
         if side == "LONG":
             if rs_interpretation == "VERY_WEAK":
-                stats["confidence_fail"] += 1
-                log_rejection("Very Weak RS", f"RS: {rs_value:.0f} — too weak for LONG")
-                return None
+                # [FIX SIGNALS v8.6] Soft penalty instead of hard reject — bearish market affects all stocks
+                confidence = max(30, confidence - 15)
+                log_rejection("Very Weak RS penalty", f"RS: {rs_value:.0f} — confidence penalised")
+                logger.debug(f"{ticker}: VERY_WEAK RS — confidence reduced by 15 (now {confidence:.1f}%)")
             elif rs_interpretation == "WEAK":
                 # Soft penalty: reduce confidence but don't reject
                 confidence = max(30, confidence - 5)
@@ -6798,37 +6799,49 @@ def get_regime_adjusted_thresholds(regime: str) -> dict:
     Return filtering thresholds adjusted for current market regime
     """
     
+    # [FIX SIGNALS v8.6] dynamic thresholds
+    preset_conf = PRESET['min_confidence']
+    preset_bt_wr = PRESET['min_backtest_win_rate']
+
+    regime_premium = {
+        'TRENDING_UP':    {'conf': 0,  'bt_wr': 0,  'score': 0},
+        'TRENDING_DOWN':  {'conf': 0,  'bt_wr': 0,  'score': 0},
+        'RANGE_BOUND':    {'conf': 5,  'bt_wr': 2,  'score': 3},
+        'HIGH_VOLATILITY':{'conf': 10, 'bt_wr': 5,  'score': 5},
+    }
+    premium = regime_premium.get(regime, regime_premium['RANGE_BOUND'])
+
     thresholds = {
         'TRENDING_UP': {
-            'min_confidence': 70,
-            'min_bt_wr': 55,
-            'min_score': 60,
-            'prefer_side': 'LONG',
-            'description': 'Trending Up - Favor LONG positions with momentum'
+            'min_confidence': preset_conf + premium['conf'],
+            'min_bt_wr':      preset_bt_wr + premium['bt_wr'],
+            'min_score':      60 + premium['score'],
+            'prefer_side':    'LONG',
+            'description':    'Trending Up — favour LONG positions with momentum'
         },
         'TRENDING_DOWN': {
-            'min_confidence': 70,
-            'min_bt_wr': 55,
-            'min_score': 60,
-            'prefer_side': 'SHORT',
-            'description': 'Trending Down - Favor SHORT positions'
+            'min_confidence': preset_conf + premium['conf'],
+            'min_bt_wr':      preset_bt_wr + premium['bt_wr'],
+            'min_score':      60 + premium['score'],
+            'prefer_side':    'SHORT',
+            'description':    'Trending Down — favour SHORT positions'
         },
         'RANGE_BOUND': {
-            'min_confidence': 75,
-            'min_bt_wr': 60,
-            'min_score': 65,
-            'prefer_side': None,
-            'description': 'Range-Bound - Require higher quality, balanced L/S'
+            'min_confidence': preset_conf + regime_premium['RANGE_BOUND']['conf'],
+            'min_bt_wr':      preset_bt_wr + regime_premium['RANGE_BOUND']['bt_wr'],
+            'min_score':      60 + regime_premium['RANGE_BOUND']['score'],
+            'prefer_side':    None,
+            'description':    'Range-Bound — slightly higher quality required'
         },
         'HIGH_VOLATILITY': {
-            'min_confidence': 80,
-            'min_bt_wr': 65,
-            'min_score': 70,
-            'prefer_side': None,
-            'description': 'High Volatility - Very selective, highest quality only'
-        }
+            'min_confidence': preset_conf + regime_premium['HIGH_VOLATILITY']['conf'],
+            'min_bt_wr':      preset_bt_wr + regime_premium['HIGH_VOLATILITY']['bt_wr'],
+            'min_score':      60 + regime_premium['HIGH_VOLATILITY']['score'],
+            'prefer_side':    None,
+            'description':    'High Volatility — selective, higher quality only'
+        },
     }
-    
+
     return thresholds.get(regime, thresholds['RANGE_BOUND'])
 
 
