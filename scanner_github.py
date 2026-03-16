@@ -8218,7 +8218,8 @@ def github_actions_main():
             
         else:
             logger.info(f"⚠️  No signals found in {scan_time:.1f}s")
-            send_no_signals_email(scan_time)
+            # [FIX] Do not send email when no signals are found
+            pass
         
         logger.info("="*80)
         logger.info("✅ GitHub Actions execution completed successfully")
