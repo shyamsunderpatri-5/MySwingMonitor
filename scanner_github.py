@@ -399,7 +399,7 @@ def update_google_sheet(signals_data):
         TIER_2_STANDARD = 'TIER_2_STANDARD'
         TIER_3_SPECULATIVE = 'TIER_3_SPECULATIVE'
 
-        allowed_tiers = {TIER_1_PREMIUM, TIER_2_STANDARD, TIER_3_SPECULATIVE}  # [FIX v8.6] Allow Tier 3
+        allowed_tiers = {TIER_1_PREMIUM, TIER_2_STANDARD, TIER_3_SPECULATIVE, 'N/A', 'UNKNOWN'}  # [FIX v8.6] Allow Tier 3 and unknown
 
         for i, sig in enumerate(signals_data, 1):
             tier = sig.get('tier', sig.get('Tier', 'UNKNOWN'))
@@ -553,7 +553,7 @@ def final_trade_gate(signals: list) -> tuple:
     # CHECK 2: TIER VALIDATION
     # ═══════════════════════════════════════════════════════════════════════
     
-    ALLOWED_TIERS = {'TIER_1_PREMIUM', 'TIER_2_STANDARD', 'TIER_3_SPECULATIVE'}  # [FIX v8.6] Allow Tier 3
+    ALLOWED_TIERS = {'TIER_1_PREMIUM', 'TIER_2_STANDARD', 'TIER_3_SPECULATIVE', 'N/A', 'UNKNOWN'}  # [FIX v8.6] Allow Tier 3 and unknown
     
     for i, sig in enumerate(signals, 1):
         ticker = sig.get('ticker', sig.get('Ticker', 'UNKNOWN'))
