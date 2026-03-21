@@ -1,0 +1,14 @@
+2026-03-16 19:27:50,602 - WARNING - Kite session init failed: API credentials not configured in config_kite.py
+2026-03-16 19:27:50,607 - WARNING - Capital config: Google Sheets not configured — using fallback Rs.50000
+2026-03-16 20:07:54,176 - WARNING - Kite session init failed: API credentials not configured in config_kite.py
+2026-03-16 20:07:54,302 - WARNING - Capital config: Google Sheets not configured — using fallback Rs.50000
+2026-03-16 20:07:54,317 - INFO - ================================================================================
+2026-03-16 20:07:54,318 - INFO - NSE SCANNER v8.5 - GITHUB ACTIONS EXECUTION WITH GOOGLE SHEETS
+2026-03-16 20:07:54,319 - INFO - Timestamp: 2026-03-16 20:07:54 IST
+2026-03-16 20:07:54,321 - INFO - GitHub Repository: N/A
+2026-03-16 20:07:54,324 - INFO - Workflow Run: #N/A
+2026-03-16 20:07:54,327 - INFO - Google Sheets: ENABLED
+2026-03-16 20:07:54,328 - INFO - ================================================================================
+2026-03-16 20:07:54,397 - ERROR - Google credentials not found in environment variables
+2026-03-21 13:50:28,012 - WARNING - Kite session init failed: API credentials not configured in config_kite.py
+2026-03-21 13:50:28,014 - WARNING - Capital config: Google Sheets not configured — using fallback Rs.50000

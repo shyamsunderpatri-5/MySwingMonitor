@@ -395,9 +395,7 @@ def update_google_sheet(signals_data):
         # 🆕 CRITICAL: TIER VALIDATION
         # ════════════════════════════════════════════════════════════════════
 
-        BEST_OF_BEST = 'BEST_OF_BEST'
-
-        allowed_tiers = {BEST_OF_BEST}  # [FIX] Only allow Best of Best
+        allowed_tiers = {'TIER_1_PREMIUM', 'TIER_2_STANDARD', 'BEST_OF_BEST'}
 
         for i, sig in enumerate(signals_data, 1):
             tier = sig.get('tier', sig.get('Tier', 'UNKNOWN'))
@@ -407,10 +405,10 @@ def update_google_sheet(signals_data):
             if tier not in allowed_tiers:
                 logger.critical(f"❌ TIER VIOLATION: Signal #{i} ({ticker}) has Tier: {tier}")
                 logger.critical(f"❌ Only {allowed_tiers} are allowed for production trading")
-                logger.critical(f"❌ REFUSING to upload - Tier-3 detected!")
+                logger.critical(f"❌ REFUSING to upload as tier is rejected!")
                 return False
 
-        logger.info("✅ TIER VALIDATION PASSED: All signals are Tier-1 or Tier-2")
+        logger.info("✅ TIER VALIDATION PASSED: All signals are valid production tiers")
 
         # ════════════════════════════════════════════════════════════════════
         # 🆕 CRITICAL: BACKTEST INTEGRITY CHECK
@@ -551,7 +549,7 @@ def final_trade_gate(signals: list) -> tuple:
     # CHECK 2: TIER VALIDATION
     # ═══════════════════════════════════════════════════════════════════════
     
-    ALLOWED_TIERS = {'BEST_OF_BEST'}
+    ALLOWED_TIERS = {'TIER_1_PREMIUM', 'TIER_2_STANDARD', 'BEST_OF_BEST'}
     
     for i, sig in enumerate(signals, 1):
         ticker = sig.get('ticker', sig.get('Ticker', 'UNKNOWN'))
@@ -1632,7 +1630,7 @@ kite_provider = KiteDataProvider()
 # CONFIGURATION - CHANGE THESE SETTINGS
 # ============================================================================
 
-ACCURACY_MODE = 'CONSERVATIVE'  # [FIX] Ultra strict for BEST OF BEST
+ACCURACY_MODE = 'BALANCED'
 BACKTEST_MODE = 'MINI'  # [FIX v8.6] Switched from HYBRID — full backtest killing valid signals
 
 # ── FIX: CNC SHORT TRADING NOT SUPPORTED ON NSE EQUITY ──────────────────────
@@ -6361,7 +6359,9 @@ def print_results(results: List[Dict]):
     
     # Print each tier
     tier_info = {
-        "BEST_OF_BEST": ("💎 BEST OF BEST STOCKS (Ultra Strict Validation)", "Real money premium setups"),
+        "TIER_1_PREMIUM": ("🟢 TIER 1: PREMIUM SIGNALS (Highest Probability)", "Take with 30-40% position size"),
+        "TIER_2_STANDARD": ("🟡 TIER 2: STANDARD SIGNALS (Good Probability)", "Take with 15-20% position size"),
+        "TIER_3_SPECULATIVE": ("🔵 TIER 3: SPECULATIVE SIGNALS (Acceptable Risk)", "Take with 5-10% position size"),
     }
     
     for tier_name, (tier_title, tier_advice) in tier_info.items():
@@ -6710,7 +6710,22 @@ def classify_signal_tier(result: Dict, backtest_result: Optional[BacktestResult]
     ]
     
     if sum(1 for x in tier1_checks if x) >= 3:
-        return "BEST_OF_BEST"
+        return "TIER_1_PREMIUM"
+        
+    # Tier 2 Requirements (STANDARD)
+    tier2_checks = [
+        confidence >= 60,
+        rr >= 1.5,
+        mini_bt.get('success_reason', '') in ['Target hit, stop not hit', 'Target hit before stop'] or not has_backtest,
+        bt_win_rate >= 50 if has_backtest else True,
+        bt_pf >= 1.3 if has_backtest else True,
+    ]
+    if sum(1 for x in tier2_checks if x) >= 3:
+        return "TIER_2_STANDARD"
+        
+    # Tier 3 (SPECULATIVE)
+    if confidence >= 55 and rr >= 1.3:
+        return "TIER_3_SPECULATIVE"
         
     return "REJECTED"
 
@@ -7044,7 +7059,9 @@ def select_top_5_signals(results: list) -> list:
         4. Ticker (alphabetical - ultimate tie-breaker)
         """
         tier_rank = {
-            'BEST_OF_BEST': 1
+            'TIER_1_PREMIUM': 1,
+            'TIER_2_STANDARD': 2,
+            'TIER_3_SPECULATIVE': 3
         }
         
         bt = stock.get('backtest', {})
@@ -7277,7 +7294,9 @@ def apply_tier_based_filtering(results: List[Dict]) -> Dict[str, List[Dict]]:
     """
     
     tiers = {
-        "BEST_OF_BEST": []
+        "TIER_1_PREMIUM": [],
+        "TIER_2_STANDARD": [],
+        "TIER_3_SPECULATIVE": []
     }
     
     for result in results:
