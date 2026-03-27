@@ -1350,6 +1350,15 @@ def get_realtime_price(ticker):
             data = kite_session.get_realtime_price_kite(symbol, exchange)
             if data:
                 return data
+                
+        # Fallback to yfinance if Kite is disconnected to prevent auto-exit blocks
+        import yfinance as yf
+        yf_symbol = f"{symbol}.NS" if exchange == "NSE" else f"{symbol}.BO"
+        ticker_obj = yf.Ticker(yf_symbol)
+        info = ticker_obj.fast_info
+        if hasattr(info, 'last_price') and info.last_price is not None:
+            return {'price': info.last_price}
+            
     except Exception as e:
         logger.error(f"Realtime price error for {ticker}: {e}")
     return None
@@ -4729,6 +4738,20 @@ def load_portfolio():
         # ✅ NEW: Ensure Zerodha_Order_ID column exists
         if 'Zerodha_Order_ID' not in df.columns:
             df['Zerodha_Order_ID'] = ''
+            
+        # ✅ Pre-seed persistent guards to prevent API rate limits
+        st.session_state['portfolio_loaded_today'] = True
+        if 'Last_Auto_Action' in df.columns:
+            today_str = get_ist_now().strftime('%Y-%m-%d')
+            for _, r in df.iterrows():
+                t = str(r.get('Ticker', '')).strip()
+                action = str(r.get('Last_Auto_Action', ''))
+                if action and today_str in action:
+                    action_parts = action.split('|')
+                    if len(action_parts) > 0:
+                        a_type = action_parts[0]
+                        k = f"{a_type}_{t}_{today_str}"
+                        st.session_state[k] = action
         
         st.success(f"✅ Loaded {len(df)} active positions from Google Sheets")
         
@@ -4884,6 +4907,11 @@ def get_persistent_guard(ticker, action_type):
     # Check session state first (fast path)
     if guard_key in st.session_state:
         return True, st.session_state[guard_key]
+        
+    # If we already loaded the portfolio sheet today, we have all actions cached.
+    # We can skip the expensive API call to Google Sheets to avoid 429 quota errors.
+    if st.session_state.get('portfolio_loaded_today'):
+        return False, ""
     
     # Check Google Sheet for persistent record
     try:
@@ -7309,8 +7337,8 @@ def main():
         sorted_results = sorted(results, key=get_sort_priority)
         
         for r in sorted_results:
-            # Fetch df for this stock
-            _stock_df = get_stock_data_safe(r['ticker'], period="6mo")
+            # Fetch df for this stock (silent=True to prevent duplicate Kite warnings)
+            _stock_df = get_stock_data_safe(r['ticker'], period="6mo", silent=True)
             r['df'] = _stock_df
             
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
