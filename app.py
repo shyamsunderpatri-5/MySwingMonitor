@@ -428,7 +428,16 @@ def get_market_health(_kite_connected: bool = False):
             nifty_df = kite_session.get_market_index_data("NIFTY 50")
 
         if nifty_df is None or nifty_df.empty:
-            return None
+            # Fallback to yfinance
+            import yfinance as yf
+            nifty_df = yf.download("^NSEI", period="6mo", progress=False)
+            if nifty_df.empty:
+                return None
+            if isinstance(nifty_df.columns, pd.MultiIndex):
+                try:
+                    nifty_df.columns = [c[0] for c in nifty_df.columns]
+                except:
+                    pass
 
         nifty_price = float(nifty_df['Close'].iloc[-1])
         nifty_prev  = float(nifty_df['Close'].iloc[-2]) if len(nifty_df) > 1 else nifty_price
@@ -446,6 +455,18 @@ def get_market_health(_kite_connected: bool = False):
         if HAS_KITE and kite_session and kite_session.is_connected:
             vix_df = kite_session.get_market_index_data("INDIA VIX")
             if vix_df is not None and not vix_df.empty:
+                vix_value = float(vix_df['Close'].iloc[-1])
+        
+        # Fallback to yfinance for VIX if still default and not via Kite
+        if vix_value == 15 and not (HAS_KITE and kite_session and kite_session.is_connected):
+            import yfinance as yf
+            vix_df = yf.download("^INDIAVIX", period="1mo", progress=False)
+            if not vix_df.empty:
+                if isinstance(vix_df.columns, pd.MultiIndex):
+                    try:
+                        vix_df.columns = [c[0] for c in vix_df.columns]
+                    except:
+                        pass
                 vix_value = float(vix_df['Close'].iloc[-1])
         
         # Calculate Market Health Score (0-100)
@@ -1262,9 +1283,28 @@ def get_stock_data_safe(ticker, period="6mo", silent=False):
     if not (HAS_KITE and kite_session and kite_session.is_connected):
         if not silent:
             st.warning(
-                f"⚠️ **Kite not connected** — cannot fetch data for `{symbol}`. "
-                f"Please login via the **sidebar → Zerodha Login** section."
+                f"⚠️ **Kite not connected** — fetching `{symbol}` via yfinance fallback. "
+                f"Please login via the **sidebar → Zerodha Login** for live Kite data."
             )
+        # Fallback to yfinance
+        try:
+            import yfinance as yf
+            yf_symbol = f"{symbol}.NS" if exchange == "NSE" else f"{symbol}.BO"
+            df = yf.download(yf_symbol, period=period, progress=False)
+            if df is not None and not df.empty:
+                if isinstance(df.columns, pd.MultiIndex):
+                    try:
+                        df.columns = [c[0] for c in df.columns]
+                    except:
+                        pass
+                df.reset_index(inplace=True)
+                # Ensure 'Date' column exists
+                if 'Datetime' in df.columns and 'Date' not in df.columns:
+                    df.rename(columns={'Datetime': 'Date'}, inplace=True)
+                return df
+        except Exception as e:
+            logger.error(f"yfinance fallback failed for {symbol}: {e}")
+            pass
         return None
 
     max_retries = 3
@@ -4738,11 +4778,14 @@ def validate_portfolio(df):
         ticker = str(row.get('Ticker', f'Row {idx}')).strip()
         
         try:
-            entry = float(row['Entry_Price'])
-            sl = float(row['Stop_Loss'])
-            target = float(row['Target_1'])
+            def clean_numstr(val):
+                return str(val).replace(',', '').replace('₹', '').replace('Rs.', '').replace('Rs', '').strip()
+            
+            entry = float(clean_numstr(row['Entry_Price']))
+            sl = float(clean_numstr(row['Stop_Loss']))
+            target = float(clean_numstr(row['Target_1']))
             position = str(row['Position']).upper().strip()
-            status = str(row['Status']).upper().strip()
+            status = str(row.get('Status', 'ACTIVE')).upper().strip()
         except (ValueError, TypeError) as e:
             errors.append(f"❌ {ticker}: Invalid number format - {e}")
             continue
