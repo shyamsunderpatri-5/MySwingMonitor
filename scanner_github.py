@@ -292,15 +292,25 @@ def format_sheet_row(signal_data, entry_date):
             f"R:R:{rr_ratio:.1f}x | {setup} | {sector}{alert_note}"
         )
 
+        # --- SAFEGUARD: Prevent Entry == SL which crashes MySwingMonitor
+        final_entry = round(float(entry_price), 2) if entry_price else 0
+        final_sl = round(float(stop_loss), 2) if stop_loss else 0
+        
+        if final_entry > 0 and final_entry == final_sl:
+            if 'LONG' in side_display.upper():
+                final_sl = round(final_entry * 0.99, 2)
+            else:
+                final_sl = round(final_entry * 1.01, 2)
+
         # ── EXACT 10-column layout matching your Google Sheet ────────────────
         # Ticker | Position | Entry_Price | Quantity | Stop_Loss |
         # Target_1 | Target_2 | Entry_Date | Status | Notes
         row = [
             ticker,                                                        # A: Ticker
             side_display,                                                  # B: Position (LONG/SHORT)
-            round(float(entry_price), 2) if entry_price else 0,           # C: Entry_Price
-            '',                                                            # D: Quantity — YOU FILL THIS
-            round(float(stop_loss), 2) if stop_loss else 0,               # E: Stop_Loss
+            final_entry,                                                   # C: Entry_Price
+            10,                                                            # D: Quantity (Default 10)
+            final_sl,                                                      # E: Stop_Loss
             round(float(target_1), 2) if target_1 else 0,                 # F: Target_1
             round(float(target_2), 2) if target_2 else 0,                 # G: Target_2
             entry_date,                                                    # H: Entry_Date
@@ -309,7 +319,7 @@ def format_sheet_row(signal_data, entry_date):
         ]
 
         logger.info(f"Formatted row → {ticker} ({side_display}) Rank#{rank}: "
-                    f"Entry={entry_price}, SL={stop_loss}, T1={target_1}, T2={target_2}")
+                    f"Entry={final_entry}, SL={final_sl}, T1={target_1}, T2={target_2}")
         return row
         
     except Exception as e:
